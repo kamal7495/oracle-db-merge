@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Oracle DB Merge</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --b:#d0d7de; --bg:#f6f8fa; --accent:#0969da; }
+  body { font:14px/1.45 system-ui,sans-serif; margin:0; color:#1b1f24; }
+  header { background:#0d1117; color:#fff; padding:14px 24px; }
+  header h1 { margin:0; font-size:18px; }
+  header span { color:#8b949e; font-size:12px; }
+  main { max-width:1100px; margin:0 auto; padding:20px 24px 60px; }
+  section { border:1px solid var(--b); border-radius:8px; padding:16px; margin-bottom:20px; }
+  h2 { margin:0 0 12px; font-size:16px; }
+  form { display:grid; grid-template-columns:repeat(6,1fr); gap:10px; }
+  label { display:flex; flex-direction:column; font-size:12px; color:#57606a; gap:3px; }
+  input[type=text],input[type=number],input[type=password] { padding:6px 8px; border:1px solid var(--b); border-radius:6px; font-size:14px; }
+  .span2 { grid-column:span 2; } .full { grid-column:1/-1; }
+  button { padding:6px 14px; border:1px solid var(--b); background:var(--bg); border-radius:6px; cursor:pointer; font-size:13px; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button:disabled { opacity:.5; cursor:default; }
+  table { width:100%; border-collapse:collapse; }
+  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--b); font-size:13px; vertical-align:top; }
+  .msg { margin-top:8px; font-size:13px; } .err { color:#cf222e; } .good { color:#1a7f37; }
+  .badge { border-radius:10px; padding:1px 8px; font-size:12px; font-weight:600; }
+  .CRITICAL { background:#ffd8d3; color:#82071e; } .HIGH { background:#ffe1c2; color:#7d3a00; }
+  .MEDIUM { background:#fff2b3; color:#5c4400; } .LOW { background:#dff6dd; color:#0f5323; }
+  .phases { color:#57606a; font-size:12px; margin-top:4px; }
+  td.miss { background:#ffebe9; font-style:italic; }
+  .notice { background:#fff8c5; border:1px solid #d4a72c; border-radius:6px; padding:8px 12px; font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Oracle DB Merge <span>DDL compare, data compare &amp; merge</span></h1>
+</header>
+<main>
+  <section>
+    <h2>1. Connections</h2>
+    <form id="addForm" autocomplete="off">
+      <label>Nickname<input type="text" name="nickname" required placeholder="DB_A" maxlength="30"></label>
+      <label>Host<input type="text" name="host" value="localhost"></label>
+      <label>Port<input type="number" name="port" value="1521" min="1" max="65535"></label>
+      <label>Service name<input type="text" name="serviceName" required placeholder="FREEPDB1"></label>
+      <label>Username<input type="text" name="username" required></label>
+      <label>Password<input type="password" name="password" required autocomplete="new-password"></label>
+      <label class="span2">Schema to compare (optional, defaults to username)<input type="text" name="schema"></label>
+      <div class="full"><button class="primary" type="submit">Add connection</button>
+        <span class="phases">Passwords are kept in server memory only and are never logged or written to disk.</span></div>
+    </form>
+    <div id="addMsg" class="msg"></div>
+    <table id="connTable" style="margin-top:12px">
+      <thead><tr><th></th><th>Nickname</th><th>Target</th><th>User / schema</th><th>Status</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>2. Phase 1 &mdash; compare DDL</h2>
+    <p class="phases">Tick two or more connections. Every database is compared with every other; sources are opened read-only.</p>
+    <button class="primary" id="runBtn" disabled>Extract &amp; compare</button>
+    <span id="runMsg" class="msg"></span>
+    <div id="result" style="margin-top:14px"></div>
+  </section>
+
+  <section id="dataSection" style="display:none">
+    <h2>3. Phase 2 &mdash; compare data</h2>
+    <p class="phases">Pick the business key per table (default: primary key). Pick a natural key such as e-mail or SKU when ids were assigned independently in each database. Row data is read-only.</p>
+    <table id="keyTable"><thead><tr><th>Table</th><th>In</th><th>Business key columns</th></tr></thead><tbody></tbody></table>
+    <p><button class="primary" id="dataBtn">Compare data</button> <span id="dataMsg" class="msg"></span></p>
+    <div id="dataResult"></div>
+  </section>
+
+  <section id="mergeSection" style="display:none">
+    <h2>4. Phase 3 &mdash; merge into a master</h2>
+    <p class="notice">The master is the only database that can ever be written. Every other selected database is read-only. A dry run changes nothing:
+      it produces the full SQL script and a preview report. Take a Data Pump backup of the master before executing.</p>
+    <p><label style="display:inline-flex;flex-direction:row;gap:6px;align-items:center">Master:
+        <select id="masterSel"></select></label>
+      <label style="display:inline-flex;flex-direction:row;gap:6px;align-items:center;margin-left:16px"><input type="checkbox" id="optTriggers"> disable master triggers during load (re-enabled afterwards)</label>
+      <label style="display:inline-flex;flex-direction:row;gap:6px;align-items:center;margin-left:16px">orphan rows:
+        <select id="optOrphan"><option value="FAIL">block the merge</option><option value="SKIP">skip them</option></select></label></p>
+    <p><button class="primary" id="planBtn">Dry run (change nothing)</button> <span id="planMsg" class="msg"></span></p>
+    <div id="planResult"></div>
+    <div id="execBox" style="display:none;border-top:1px solid var(--b);margin-top:14px;padding-top:12px">
+      <h2>Execute</h2>
+      <p id="backupText" class="err"></p>
+      <p><label style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" id="backupOk"> I have taken a Data Pump backup of the master.</label></p>
+      <p><label>Type <b id="phrase"></b> to confirm <input type="text" id="confirmText" autocomplete="off" style="width:360px"></label></p>
+      <p><button class="primary" id="execBtn" style="background:#cf222e;border-color:#cf222e">Execute merge (one transaction)</button> <span id="execMsg" class="msg"></span></p>
+      <div id="execResult"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const el = (tag, props = {}, ...kids) => {
+  const e = document.createElement(tag);
+  Object.assign(e, props);
+  kids.forEach(k => e.append(k));
+  return e;
+};
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  let body = null;
+  const text = await r.text();
+  try { body = text ? JSON.parse(text) : null; } catch (_) { /* not json */ }
+  if (!r.ok) throw new Error((body && body.error) || ('HTTP ' + r.status));
+  return body;
+}
+
+function selected() {
+  return [...document.querySelectorAll('#connTable input[type=checkbox]:checked')].map(c => c.value);
+}
+function updateRunBtn() { $('#runBtn').disabled = selected().length < 2; }
+
+async function loadConnections() {
+  const list = await api('/api/connections');
+  const tbody = $('#connTable tbody');
+  tbody.replaceChildren();
+  for (const c of list) {
+    const status = el('td');
+    const cb = el('input', { type: 'checkbox', value: c.nickname });
+    cb.addEventListener('change', updateRunBtn);
+    const test = el('button', { textContent: 'Test' });
+    test.addEventListener('click', async () => {
+      status.className = ''; status.textContent = 'testing…';
+      try {
+        const r = await api('/api/connections/' + encodeURIComponent(c.nickname) + '/test', { method: 'POST' });
+        status.className = r.ok ? 'good' : 'err';
+        status.textContent = r.ok ? (r.message + ' ' + (r.serverVersion || '') + ' (' + r.elapsedMillis + ' ms)') : r.message;
+      } catch (e) { status.className = 'err'; status.textContent = e.message; }
+    });
+    const del = el('button', { textContent: 'Remove' });
+    del.addEventListener('click', async () => {
+      await api('/api/connections/' + encodeURIComponent(c.nickname), { method: 'DELETE' });
+      loadConnections();
+    });
+    tbody.append(el('tr', {},
+      el('td', {}, cb), el('td', { textContent: c.nickname }),
+      el('td', { textContent: c.host + ':' + c.port + '/' + c.serviceName }),
+      el('td', { textContent: c.username + ' / ' + c.schema }),
+      status, el('td', {}, test, ' ', del)));
+  }
+  updateRunBtn();
+}
+
+$('#addForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const f = ev.target;
+  const data = Object.fromEntries(new FormData(f).entries());
+  data.port = data.port ? Number(data.port) : null;
+  $('#addMsg').className = 'msg';
+  try {
+    await api('/api/connections', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+    f.elements.password.value = '';
+    f.elements.nickname.value = '';
+    $('#addMsg').textContent = 'Added.';
+    $('#addMsg').classList.add('good');
+    loadConnections();
+  } catch (e) {
+    $('#addMsg').textContent = e.message;
+    $('#addMsg').classList.add('err');
+  }
+});
+
+$('#runBtn').addEventListener('click', async () => {
+  const btn = $('#runBtn');
+  btn.disabled = true;
+  $('#runMsg').className = 'msg';
+  $('#runMsg').textContent = 'Extracting and comparing…';
+  $('#result').replaceChildren();
+  try {
+    const r = await api('/api/ddl/compare', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nicknames: selected(), includeDdl: true }) });
+    $('#runMsg').textContent = '';
+    renderResult(r);
+    await loadKeyPicker(r.id);
+    showMerge(r.databases.map(d => d.nickname));
+  } catch (e) {
+    $('#runMsg').textContent = e.message;
+    $('#runMsg').classList.add('err');
+  } finally { updateRunBtn(); }
+});
+
+function renderResult(r) {
+  const root = $('#result');
+  const chips = el('p');
+  for (const [sev, n] of Object.entries(r.severityCounts)) {
+    chips.append(el('span', { className: 'badge ' + sev, textContent: sev + ': ' + n }), ' ');
+  }
+  root.append(
+    el('p', {}, el('strong', { textContent: r.differenceCount + ' difference(s). ' }),
+      el('a', { href: r.htmlReport, target: '_blank', rel: 'noopener', textContent: 'Open HTML report' }), ' · ',
+      el('a', { href: r.excelReport, textContent: 'Download Excel report' })),
+    chips);
+  const warn = r.databases.flatMap(d => d.warnings.map(w => d.nickname + ': ' + w));
+  if (warn.length) root.append(el('p', { className: 'err', textContent: warn.length + ' extraction warning(s) — see report.' }));
+  if (!r.differences.length) { root.append(el('p', { className: 'good', textContent: 'No structural differences.' })); return; }
+
+  const dbs = r.databases.map(d => d.nickname);
+  const table = el('table');
+  table.append(el('thead', {}, el('tr', {}, ...['Severity', 'Kind', 'Object', ...dbs].map(h => el('th', { textContent: h })))));
+  const tb = el('tbody');
+  for (const d of r.differences) {
+    const tr = el('tr', {}, el('td', {}, el('span', { className: 'badge ' + d.severity, textContent: d.severity })),
+      el('td', { textContent: d.kind }), el('td', { textContent: d.object }));
+    for (const db of dbs) {
+      const v = d.values[db] || '';
+      tr.append(el('td', { className: v.startsWith('(') ? 'miss' : '', textContent: v }));
+    }
+    tb.append(tr);
+  }
+  table.append(tb);
+  root.append(table);
+  if (r.truncated) root.append(el('p', { className: 'phases', textContent: 'Showing the first ' + r.differences.length + '; the reports contain all findings.' }));
+}
+
+let currentDdlId = null;
+
+async function loadKeyPicker(ddlId) {
+  currentDdlId = ddlId;
+  const tables = await api('/api/ddl/' + encodeURIComponent(ddlId) + '/tables');
+  const tbody = $('#keyTable tbody');
+  tbody.replaceChildren();
+  for (const t of tables) {
+    const cell = el('td');
+    for (const col of t.columns) {
+      const cb = el('input', { type: 'checkbox', value: col, checked: t.primaryKey.includes(col) });
+      cb.dataset.table = t.table;
+      cell.append(el('label', { style: 'display:inline-flex;flex-direction:row;gap:3px;margin-right:12px;color:inherit;font-size:13px' }, cb, col));
+    }
+    if (!t.columns.length) cell.textContent = '—';
+    tbody.append(el('tr', {}, el('td', { textContent: t.table }), el('td', { textContent: t.presentIn.join(', ') }), cell));
+  }
+  $('#dataSection').style.display = '';
+  $('#dataResult').replaceChildren();
+}
+
+$('#dataBtn').addEventListener('click', async () => {
+  const keys = {};
+  document.querySelectorAll('#keyTable input[type=checkbox]').forEach(cb => {
+    if (cb.checked) (keys[cb.dataset.table] = keys[cb.dataset.table] || []).push(cb.value);
+  });
+  $('#dataBtn').disabled = true;
+  $('#dataMsg').className = 'msg';
+  $('#dataMsg').textContent = 'Reading and comparing rows…';
+  $('#dataResult').replaceChildren();
+  try {
+    const r = await api('/api/data/compare', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ddlId: currentDdlId, keys }) });
+    $('#dataMsg').textContent = '';
+    renderData(r);
+  } catch (e) {
+    $('#dataMsg').textContent = e.message;
+    $('#dataMsg').classList.add('err');
+  } finally { $('#dataBtn').disabled = false; }
+});
+
+function renderData(r) {
+  const root = $('#dataResult');
+  root.append(el('p', {}, el('a', { href: r.htmlReport, target: '_blank', rel: 'noopener', textContent: 'Open HTML report' }), ' · ',
+    el('a', { href: r.excelReport, textContent: 'Download Excel report' })));
+  const table = el('table');
+  table.append(el('thead', {}, el('tr', {}, ...['Table', 'Key', 'Rows per DB', 'Only in one', 'Identical', 'Conflicts', 'PK collisions', 'Status']
+    .map(h => el('th', { textContent: h })))));
+  const tb = el('tbody');
+  for (const t of r.tables) {
+    const compared = t.status === 'COMPARED';
+    tb.append(el('tr', {},
+      el('td', { textContent: t.table }),
+      el('td', { textContent: (t.key || []).join(', ') + (t.keyIsPrimaryKey ? ' (PK)' : '') }),
+      el('td', { textContent: Object.entries(t.rowCounts).map(([k, v]) => k + ': ' + (v < 0 ? '—' : v)).join('  ') }),
+      el('td', { textContent: compared ? t.onlyInOne : '' }),
+      el('td', { textContent: compared ? t.identical : '' }),
+      el('td', { textContent: compared ? t.conflicts : '' }),
+      el('td', { textContent: compared ? t.pkCollisions : '' }),
+      el('td', { textContent: compared ? (t.warnings.length ? 'compared, ' + t.warnings.length + ' warning(s)' : 'compared') : t.status + ': ' + (t.message || '') })));
+  }
+  table.append(tb);
+  root.append(table);
+}
+
+let lastDbs = [];
+let currentPlan = null;
+
+function showMerge(dbs) {
+  lastDbs = dbs;
+  const sel = $('#masterSel');
+  sel.replaceChildren(...dbs.map(d => el('option', { value: d, textContent: d })));
+  $('#mergeSection').style.display = '';
+}
+
+function collectKeys() {
+  const keys = {};
+  document.querySelectorAll('#keyTable input[type=checkbox]').forEach(cb => {
+    if (cb.checked) (keys[cb.dataset.table] = keys[cb.dataset.table] || []).push(cb.value);
+  });
+  return keys;
+}
+
+$('#planBtn').addEventListener('click', async () => {
+  const master = $('#masterSel').value;
+  $('#planBtn').disabled = true; $('#planMsg').className = 'msg'; $('#planMsg').textContent = 'Reading all databases and planning (read-only)…';
+  $('#planResult').replaceChildren(); $('#execBox').style.display = 'none';
+  try {
+    const p = await api('/api/merge/plan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+      ddlId: currentDdlId, master, sources: lastDbs.filter(d => d !== master), keys: collectKeys(),
+      disableTriggers: $('#optTriggers').checked, orphanPolicy: $('#optOrphan').value }) });
+    $('#planMsg').textContent = '';
+    currentPlan = p;
+    renderPlan(p);
+  } catch (e) { $('#planMsg').textContent = e.message; $('#planMsg').classList.add('err'); }
+  finally { $('#planBtn').disabled = false; }
+});
+
+function renderPlan(p) {
+  const root = $('#planResult');
+  root.append(el('p', {}, el('b', { textContent: 'Dry run only — nothing was changed. ' }),
+    el('a', { href: p.previewReport, target: '_blank', rel: 'noopener', textContent: 'Preview report' }), ' · ',
+    el('a', { href: p.sqlScript, target: '_blank', rel: 'noopener', textContent: 'SQL script' })));
+  if (p.issues.length) {
+    const t = el('table');
+    t.append(el('thead', {}, el('tr', {}, ...['Level', 'Table', 'Message'].map(h => el('th', { textContent: h })))));
+    const tb = el('tbody');
+    p.issues.forEach(i => tb.append(el('tr', {}, el('td', { className: i.level === 'BLOCKER' ? 'err' : '', textContent: i.level }),
+      el('td', { textContent: i.table }), el('td', { textContent: i.message }))));
+    t.append(tb); root.append(t);
+  }
+  if (p.alters.length) {
+    root.append(el('h3', { textContent: 'Schema changes to the master — approve each (Oracle commits DDL immediately, no rollback)' }));
+    p.alters.forEach(a => {
+      const cb = el('input', { type: 'checkbox', value: a.id, checked: a.requiredByPlan });
+      cb.className = 'alterCb';
+      root.append(el('div', { style: 'margin:6px 0' }, el('label', { style: 'flex-direction:row;gap:6px;color:inherit' }, cb,
+        el('span', { textContent: (a.requiredByPlan ? '[required] ' : '') + a.reason })),
+        el('pre', { textContent: a.sql, style: 'background:#f6f8fa;padding:6px;margin:2px 0;overflow:auto' })));
+    });
+  }
+  const t = el('table');
+  t.append(el('thead', {}, el('tr', {}, ...['Load order', 'Table', 'Key', 'PK strategy', 'Master rows', 'Planned actions'].map(h => el('th', { textContent: h })))));
+  const tb = el('tbody');
+  p.tables.forEach((s, i) => tb.append(el('tr', {}, el('td', { textContent: i + 1 }), el('td', { textContent: s.table }), el('td', { textContent: s.key.join(', ') }),
+    el('td', { textContent: s.pkMode + (s.sequence ? ' (' + s.sequence + ')' : '') }), el('td', { textContent: s.masterRows }),
+    el('td', { textContent: Object.entries(s.counts).map(([k, v]) => k + ': ' + v).join('  ') }))));
+  t.append(tb); root.append(t);
+
+  if (p.unresolved.length) {
+    root.append(el('h3', { textContent: 'Conflicts needing a decision (' + p.unresolved.length + ' shown)' }));
+    const tables = [...new Set(p.unresolved.map(u => u.table))];
+    tables.forEach(tn => {
+      const sel = el('select', {}, ...[['KEEP_MASTER', 'keep master'], ['TAKE_SOURCE', 'take source'], ['NEWEST', 'newest by date column']]
+        .map(([v, l]) => el('option', { value: v, textContent: l })));
+      const date = el('input', { type: 'text', placeholder: 'date column (for newest)', style: 'width:180px' });
+      const save = el('button', { textContent: 'Remember for table ' + tn });
+      const msg = el('span', { className: 'msg' });
+      save.addEventListener('click', async () => {
+        try {
+          await api('/api/merge/rules/table', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ table: tn, action: sel.value, dateColumn: date.value || null }) });
+          msg.textContent = ' saved — run the dry run again'; msg.className = 'msg good';
+        } catch (e) { msg.textContent = ' ' + e.message; msg.className = 'msg err'; }
+      });
+      root.append(el('p', {}, el('b', { textContent: tn + ': ' }), sel, ' ', date, ' ', save, msg));
+      const ct = el('table');
+      ct.append(el('thead', {}, el('tr', {}, ...['Source', 'Business key', 'Differing columns', 'Source values', 'Manual'].map(h => el('th', { textContent: h })))));
+      const cb = el('tbody');
+      p.unresolved.filter(u => u.table === tn).forEach(u => {
+        const manual = el('input', { type: 'text', placeholder: 'COL=value, COL2=value', style: 'width:200px' });
+        const mb = el('button', { textContent: 'Set manual' });
+        const mm = el('span', { className: 'msg' });
+        mb.addEventListener('click', async () => {
+          const vals = {};
+          manual.value.split(',').forEach(kv => { const i = kv.indexOf('='); if (i > 0) vals[kv.slice(0, i).trim().toUpperCase()] = kv.slice(i + 1).trim(); });
+          try {
+            await api('/api/merge/rules/row', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ table: tn, businessKey: u.businessKey, action: 'MANUAL', manualValues: vals }) });
+            mm.textContent = ' saved'; mm.className = 'msg good';
+          } catch (e) { mm.textContent = ' ' + e.message; mm.className = 'msg err'; }
+        });
+        cb.append(el('tr', {}, el('td', { textContent: u.sourceDb }), el('td', { textContent: u.businessKey }),
+          el('td', { textContent: (u.differing || []).join(', ') }), el('td', { textContent: JSON.stringify(u.sourceValues) }),
+          el('td', {}, manual, ' ', mb, mm)));
+      });
+      ct.append(cb); root.append(ct);
+    });
+  }
+  if (p.hasBlockers) {
+    root.append(el('p', { className: 'err', textContent: 'Blockers present: resolve them (decide conflicts, fix data or choose keys) and run the dry run again. Execution is disabled.' }));
+    return;
+  }
+  $('#backupText').textContent = p.backupReminder;
+  $('#phrase').textContent = p.confirmationPhrase;
+  $('#backupOk').checked = false; $('#confirmText').value = ''; $('#execResult').replaceChildren(); $('#execMsg').textContent = '';
+  $('#execBox').style.display = '';
+}
+
+$('#execBtn').addEventListener('click', async () => {
+  $('#execBtn').disabled = true; $('#execMsg').className = 'msg'; $('#execMsg').textContent = 'Executing…';
+  $('#execResult').replaceChildren();
+  try {
+    const approved = [...document.querySelectorAll('.alterCb:checked')].map(c => c.value);
+    const r = await api('/api/merge/execute', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+      planId: currentPlan.planId, confirmation: $('#confirmText').value, backupConfirmed: $('#backupOk').checked, approvedAlters: approved }) });
+    $('#execMsg').textContent = r.status + ': ' + r.message;
+    $('#execMsg').classList.add(r.status === 'SUCCEEDED' ? 'good' : 'err');
+    const root = $('#execResult');
+    if (r.finalReport && r.status !== 'REFUSED') root.append(el('p', {}, el('a', { href: r.finalReport, target: '_blank', rel: 'noopener', textContent: 'Final report' }), ' · ',
+      el('a', { href: r.logFile, target: '_blank', rel: 'noopener', textContent: 'Action log' })));
+    (r.validations || []).forEach(v => root.append(el('div', { className: v.passed ? 'good' : 'err', textContent: (v.passed ? 'PASS ' : 'FAIL ') + v.check + ' — ' + v.detail })));
+  } catch (e) { $('#execMsg').textContent = e.message; $('#execMsg').classList.add('err'); }
+  finally { $('#execBtn').disabled = false; }
+});
+
+loadConnections();
+</script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+# Optional: pre-declare connections so you don't retype them on every start.
+#
+#   cp config/sample-config.yml config/application-local.yml     (git-ignored)
+#   export DBMERGE_A_PASSWORD='...'  DBMERGE_B_PASSWORD='...'
+#   mvn spring-boot:run -Dspring-boot.run.profiles=local
+#
+# Passwords are NEVER stored in this file: they are read from environment variables.
+# An entry whose variable is empty or unset is skipped (add it in the UI instead).
+dbmerge:
+  reports-dir: reports
+  preload:
+    - nickname: DB_A
+      host: localhost
+      port: 1521
+      service-name: FREEPDB1
+      username: SAMPLE_A
+      password: ${DBMERGE_A_PASSWORD:}
+      # schema: OPTIONAL_OTHER_SCHEMA     # defaults to the username
+    - nickname: DB_B
+      host: localhost
+      port: 1521
+      service-name: FREEPDB1
+      username: SAMPLE_B
+      password: ${DBMERGE_B_PASSWORD:}

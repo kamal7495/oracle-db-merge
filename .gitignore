@@ -1,0 +1,6 @@
+target/
+reports/
+config/application-local.yml
+*.dmp
+.idea/
+*.iml
