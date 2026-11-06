@@ -21,7 +21,8 @@
         <java.version>17</java.version>
         <maven.compiler.release>17</maven.compiler.release>
         <oracle-database.version>23.5.0.24.07</oracle-database.version>
-        <testcontainers.version>1.20.4</testcontainers.version>
+        <!-- 1.21.4+ is required for Docker Engine 29 (older docker-java defaults to API 1.32, which it rejects) -->
+        <testcontainers.version>1.21.4</testcontainers.version>
         <poi.version>5.3.0</poi.version>
     </properties>
 

@@ -1,6 +1,7 @@
 package com.dbmerge.data;
 
 import com.dbmerge.conn.ConnectionSource;
+import com.dbmerge.conn.ReadOnlyRetry;
 import com.dbmerge.data.DataModel.DataReport;
 import com.dbmerge.data.DataModel.Status;
 import com.dbmerge.data.DataModel.TableDataResult;
@@ -59,6 +60,34 @@ public class DataCompareService {
         return new DataReport(UUID.randomUUID().toString().substring(0, 8), Instant.now(), ddlComparisonId, dbs, sampleLimit, results);
     }
 
+    @FunctionalInterface
+    interface ConnectionRead<T> {
+        T apply(Connection c) throws SQLException;
+    }
+
+    /**
+     * Runs a read on the shared read-only connection for {@code db}. On ORA-01466 the connection's READ ONLY
+     * transaction is older than (or too close to) the table's DDL, so it is replaced by a fresh one before the retry.
+     */
+    private <T> T read(Map<String, Connection> conns, String db, ConnectionRead<T> read) throws SQLException {
+        return ReadOnlyRetry.call(() -> {
+            try {
+                return read.apply(conns.get(db));
+            } catch (SQLException e) {
+                if (ReadOnlyRetry.isTableDefinitionChanged(e)) reopen(conns, db);
+                throw e;
+            }
+        });
+    }
+
+    private void reopen(Map<String, Connection> conns, String db) throws SQLException {
+        Connection old = conns.remove(db);
+        if (old != null) {
+            try { old.close(); } catch (SQLException ignored) { /* replaced below */ }
+        }
+        conns.put(db, connections.openReadOnly(db));
+    }
+
     private TableDataResult compareTable(String table, List<String> dbs, Map<String, SchemaModel> models,
                                          Map<String, Connection> conns, Map<String, List<String>> overrides, int sampleLimit) {
         List<String> warnings = new ArrayList<>();
@@ -69,7 +98,8 @@ public class DataCompareService {
         }
         try {
             for (String db : dbs) {
-                counts.put(db, present.contains(db) ? RowLoader.count(conns.get(db), models.get(db).owner(), table) : -1L);
+                counts.put(db, present.contains(db)
+                        ? read(conns, db, c -> RowLoader.count(c, models.get(db).owner(), table)) : -1L);
             }
         } catch (SQLException e) {
             return empty(table, Status.ERROR, "Row count failed: " + firstLine(e), counts, warnings);
@@ -124,7 +154,9 @@ public class DataCompareService {
 
         Map<String, List<Map<String, String>>> rows = new LinkedHashMap<>();
         try {
-            for (String db : present) rows.put(db, RowLoader.load(conns.get(db), models.get(db).owner(), table, columns, maxRowsPerTable));
+            for (String db : present) {
+                rows.put(db, read(conns, db, c -> RowLoader.load(c, models.get(db).owner(), table, columns, maxRowsPerTable)));
+            }
         } catch (SQLException | IllegalStateException e) {
             return empty(table, Status.ERROR, "Reading rows failed: " + firstLine(e), counts, warnings);
         }

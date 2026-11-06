@@ -4,6 +4,7 @@ import static com.dbmerge.util.Sql.columnList;
 import static com.dbmerge.util.Sql.qualified;
 
 import com.dbmerge.conn.ConnectionSource;
+import com.dbmerge.conn.ReadOnlyRetry;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
@@ -29,9 +30,14 @@ public class JdbcMergeData implements MergePlanner.MergeData {
 
     @Override
     public List<Map<String, Object>> rows(String db, String table, List<String> columns) throws SQLException {
-        List<Map<String, Object>> out = new ArrayList<>();
-        if (columns.isEmpty()) return out;
+        if (columns.isEmpty()) return new ArrayList<>();
         String sql = "SELECT " + columnList(columns) + " FROM " + qualified(connections.schemaOf(db), table);
+        // Each attempt opens a fresh READ ONLY transaction, so a retry after ORA-01466 gets a newer snapshot.
+        return ReadOnlyRetry.call(() -> load(db, table, columns, sql));
+    }
+
+    private List<Map<String, Object>> load(String db, String table, List<String> columns, String sql) throws SQLException {
+        List<Map<String, Object>> out = new ArrayList<>();
         try (Connection c = connections.openReadOnly(db);
              Statement st = c.createStatement()) {
             st.setFetchSize(1000);
