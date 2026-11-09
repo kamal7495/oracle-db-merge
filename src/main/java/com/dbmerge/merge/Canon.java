@@ -52,6 +52,23 @@ public final class Canon {
         return x == null ? y == null : x.equals(y);
     }
 
+    /**
+     * The inverse of {@link #of} for a column of the given type: rebuilds the typed value a canonical key part came
+     * from (BigDecimal, Timestamp, OffsetDateTime at UTC, byte[] or String). {@code Canon.of(parse(Canon.of(v), col))}
+     * equals {@code Canon.of(v)}.
+     */
+    static Object parse(String canonical, ColumnDef col) {
+        if (canonical == null || canonical.equals(NULL_MARK)) return null;
+        String base = col == null ? "VARCHAR2" : col.baseType();
+        if (base.equals("NUMBER") || base.equals("FLOAT") || base.equals("INTEGER") || base.startsWith("BINARY_")) {
+            return new BigDecimal(canonical);
+        }
+        if (base.equals("DATE") || base.equals("TIMESTAMP")) return Timestamp.valueOf(java.time.LocalDateTime.parse(canonical));
+        if (base.startsWith("TIMESTAMP")) return java.time.Instant.parse(canonical).atOffset(java.time.ZoneOffset.UTC);
+        if (base.equals("RAW")) return HexFormat.of().parseHex(canonical);
+        return canonical;
+    }
+
     /** Converts a manually entered string to the master column's type. */
     public static Object convert(String text, ColumnDef col) {
         if (text == null) return null;

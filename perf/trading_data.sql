@@ -1,8 +1,10 @@
 -- Fills the trading schema with deterministic synthetic data. Run as the schema owner.
--- &1 = number of trades. Keywords: 3 per trade. Messages: 1 per trade. Fees: 1 per 10 trades.
+-- &1 = number of trades, &2 = offset added to trade ids (0 for PERF_A/PERF_B; PERF_C gets trades no other schema has).
+-- Keywords: 3 per trade. Messages: 1 per trade. Fees: 1 per 10 trades. Static data is the same in every schema.
 WHENEVER SQLERROR EXIT FAILURE
 SET VERIFY OFF
 DEFINE TRADES = &1
+DEFINE OFFSET = &2
 
 ALTER SESSION ENABLE PARALLEL DML;
 
@@ -44,10 +46,10 @@ SELECT n, 'EXT-' || LPAD(n, 10, '0'), MOD(n * 31, 2000) + 1, MOD(n * 17, 5000) +
        CASE MOD(n, 3) WHEN 0 THEN 'USD' WHEN 1 THEN 'EUR' ELSE 'GBP' END,
        CASE WHEN MOD(n, 50) = 0 THEN 'CANCELED' WHEN MOD(n, 7) = 0 THEN 'PENDING' ELSE 'VERIFIED' END,
        MOD(n, 4), TIMESTAMP '2024-01-01 08:00:00' + NUMTODSINTERVAL(MOD(n, 900 * 86400), 'SECOND')
-  FROM (SELECT (a.r - 1) * 1000 + b.r AS n
+  FROM (SELECT (a.r - 1) * 1000 + b.r + &OFFSET AS n
           FROM (SELECT level r FROM dual CONNECT BY level <= CEIL(&TRADES / 1000)) a
          CROSS JOIN (SELECT level r FROM dual CONNECT BY level <= 1000) b)
- WHERE n <= &TRADES;
+ WHERE n <= &TRADES + &OFFSET;
 COMMIT;
 
 INSERT /*+ APPEND */ INTO TRADE_KEYWORD

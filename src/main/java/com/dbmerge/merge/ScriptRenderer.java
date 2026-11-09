@@ -59,15 +59,24 @@ public final class ScriptRenderer {
 
         sb.append("-- ---- Data (one transaction) ----\n");
         for (TableStep step : plan.steps()) {
-            long work = step.rows().stream().filter(r -> r.action() == RowAction.INSERT || r.action() == RowAction.INSERT_REMAPPED
-                    || r.action() == RowAction.UPDATE).count();
+            long work = step.count(RowAction.INSERT) + step.count(RowAction.INSERT_REMAPPED) + step.count(RowAction.UPDATE);
             sb.append("\n-- ").append(step.table()).append(": ")
                     .append(step.count(RowAction.INSERT)).append(" insert, ").append(step.count(RowAction.INSERT_REMAPPED)).append(" re-keyed, ")
                     .append(step.count(RowAction.UPDATE)).append(" update, ").append(step.count(RowAction.SKIP_DUPLICATE)).append(" duplicate, ")
                     .append(step.count(RowAction.SKIP_KEEP_MASTER)).append(" keep master, ").append(step.count(RowAction.SKIP_ORPHAN)).append(" orphan skipped, ")
                     .append(step.count(RowAction.UNRESOLVED_CONFLICT)).append(" unresolved\n");
             if (work == 0 && step.rows().isEmpty()) continue;
-            for (PlannedRow r : step.rows()) renderRow(sb, plan, step, r);
+            int rendered = 0;
+            boolean large = step.rows() instanceof SpooledRows;
+            for (PlannedRow r : step.rows()) {
+                if (large && rendered == LARGE_TABLE_STATEMENTS) {
+                    sb.append("-- ... ").append(step.rows().size() - rendered).append(" more planned row(s) of this large table are not written to this")
+                            .append(" review script; the executor applies all of them from the plan file.\n");
+                    break;
+                }
+                renderRow(sb, plan, step, r);
+                rendered++;
+            }
         }
         sb.append("\n-- ---- Checks (run before COMMIT) ----\n");
         for (TableStep step : plan.steps()) {
@@ -82,6 +91,9 @@ public final class ScriptRenderer {
         }
         return sb.toString();
     }
+
+    /** Statements written per streamed (large) table; the full plan lives in its plan file. */
+    static final int LARGE_TABLE_STATEMENTS = 1000;
 
     private static void renderRow(StringBuilder sb, MergePlan plan, TableStep step, PlannedRow r) {
         String t = quote(step.table());

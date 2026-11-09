@@ -14,3 +14,9 @@ dbmerge:
       service-name: FREEPDB1
       username: PERF_B
       password: ${DBMERGE_PERF_PASSWORD:}
+    - nickname: PERF_C
+      host: localhost
+      port: 1521
+      service-name: FREEPDB1
+      username: PERF_C
+      password: ${DBMERGE_PERF_PASSWORD:}

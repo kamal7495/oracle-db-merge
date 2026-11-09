@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Creates PERF_A and PERF_B in a local Oracle container and fills them with synthetic trading data.
+# Creates PERF_A and PERF_B (near copies, for comparisons) and PERF_C (same static data, different trades, for
+# merging at scale) in a local Oracle container and fills them with synthetic trading data.
 #
 #   ORACLE_PASSWORD=...  DBMERGE_PERF_PASSWORD=...  perf/setup.sh [TRADES] [CONTAINER]
 #
@@ -28,23 +29,24 @@ echo "== users"
 docker exec -i -e ORACLE_PASSWORD -e DBMERGE_PERF_PASSWORD "$CONTAINER" bash -c '
   { echo "CONNECT SYSTEM/\"$ORACLE_PASSWORD\"@localhost:1521/FREEPDB1"
     echo "WHENEVER SQLERROR CONTINUE"
-    echo "DROP USER PERF_A CASCADE;"; echo "DROP USER PERF_B CASCADE;"; echo "DROP ROLE DBM_PERF_READER;"
+    echo "DROP USER PERF_A CASCADE;"; echo "DROP USER PERF_B CASCADE;"; echo "DROP USER PERF_C CASCADE;"; echo "DROP ROLE DBM_PERF_READER;"
     echo "WHENEVER SQLERROR EXIT FAILURE"
     echo "CREATE ROLE DBM_PERF_READER;"
-    for u in PERF_A PERF_B; do
+    for u in PERF_A PERF_B PERF_C; do
       echo "CREATE USER $u IDENTIFIED BY \"$DBMERGE_PERF_PASSWORD\" QUOTA UNLIMITED ON USERS;"
       echo "GRANT CREATE SESSION, CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE SEQUENCE, CREATE SYNONYM TO $u;"
       echo "GRANT DBM_PERF_READER TO $u WITH ADMIN OPTION;"
     done
     echo "EXIT"; } | sqlplus -s /nolog'
 
-for u in PERF_A PERF_B; do
+for u in PERF_A PERF_B PERF_C; do
   echo "== $u: schema"
   sql "$u" < "$HERE/trading_schema.sql"
-  echo "== $u: data ($TRADES trades)"
+  offset=0; [ "$u" = PERF_C ] && offset=$TRADES
+  echo "== $u: data ($TRADES trades, ids from $((offset + 1)))"
   start=$SECONDS
   sql "$u" <<SQL
-@/tmp/dbmerge-perf/trading_data.sql $TRADES
+@/tmp/dbmerge-perf/trading_data.sql $TRADES $offset
 SQL
   echo "   loaded in $((SECONDS - start)) s"
 done

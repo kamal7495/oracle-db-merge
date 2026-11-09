@@ -50,6 +50,81 @@ public class MergeExecutor {
 
     private record Inserted(TableStep step, PlannedRow row, Map<String, Object> pk) { }
 
+    private static final int BATCH = 1000;
+
+    /**
+     * Batched INSERTs of one table: rows with the same statement shape share a PreparedStatement and go to Oracle
+     * 1000 at a time, in plan order. Flushed when the shape changes, before any other statement, and at the end of the
+     * table, so parents are always written before their children.
+     */
+    private static final class InsertBatch implements AutoCloseable {
+        private final Connection c;
+        private String sql;
+        private PreparedStatement ps;
+        private int pending;
+
+        InsertBatch(Connection c) { this.c = c; }
+
+        PreparedStatement statementFor(String insertSql) throws SQLException {
+            if (!insertSql.equals(sql)) {
+                flush();
+                if (ps != null) ps.close();
+                ps = c.prepareStatement(insertSql);
+                sql = insertSql;
+            }
+            return ps;
+        }
+
+        void added() throws SQLException {
+            ps.addBatch();
+            if (++pending >= BATCH) flush();
+        }
+
+        void flush() throws SQLException {
+            if (ps != null && pending > 0) {
+                int[] done = ps.executeBatch();
+                for (int n : done) {
+                    if (n != 1 && n != Statement.SUCCESS_NO_INFO) throw new SQLException("A batched INSERT inserted " + n + " rows, expected 1");
+                }
+                pending = 0;
+            }
+        }
+
+        @Override
+        public void close() throws SQLException {
+            try { flush(); } finally { if (ps != null) ps.close(); }
+        }
+    }
+
+    /** Sequence values fetched 1000 at a time instead of one round trip per re-keyed row. */
+    private static final class SequencePool {
+        private final Map<String, java.util.ArrayDeque<java.math.BigDecimal>> free = new HashMap<>();
+
+        /** @param stillNeeded re-keyed rows of this table not yet given a value: at most that many are fetched */
+        Object next(Connection c, String schema, String seq, long stillNeeded) throws SQLException {
+            java.util.ArrayDeque<java.math.BigDecimal> q = free.computeIfAbsent(seq, k -> new java.util.ArrayDeque<>());
+            if (q.isEmpty()) {
+                long n = Math.max(1, Math.min(BATCH, stillNeeded));
+                try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery("SELECT " + qualified(schema, seq)
+                        + ".NEXTVAL FROM dual CONNECT BY LEVEL <= " + n)) {
+                    while (rs.next()) q.add(rs.getBigDecimal(1));
+                }
+            }
+            return q.poll();
+        }
+    }
+
+    /**
+     * Whether a table's INSERTs can be batched. Not when an enabled trigger stays active during the load: it may set the
+     * primary key itself, and only a single-row INSERT can return the key Oracle actually stored.
+     */
+    private static boolean batchable(MergePlan plan, TableStep step) {
+        TableDef def = plan.effectiveTables().get(step.table());
+        if (def == null) return true;
+        List<String> disabled = plan.triggersToDisable().getOrDefault(step.table(), List.of());
+        return def.triggers().stream().noneMatch(t -> "ENABLED".equalsIgnoreCase(t.status()) && !disabled.contains(t.name()));
+    }
+
     public MergeResult execute(MergePlan plan, Set<String> approvedAlterIds) {
         List<String> log = new ArrayList<>();
         List<ValidationResult> validations = new ArrayList<>();
@@ -99,20 +174,34 @@ public class MergeExecutor {
             }
             // 4. baseline orphan counts, then the data transaction
             Map<String, Long> baseline = orphanCounts(c, schema, plan);
-            Map<String, Map<String, Object>> keyMap = new HashMap<>();
+            KeyMap keyMap = new KeyMap(plan.effectiveTables());
+            SequencePool sequences = new SequencePool();
+            Set<String> referenced = MergePlanner.referencedTables(plan.effectiveTables()); // only these need key lookups
+            // only rows whose key the run allocates (sequence): later rows matched to them have no key in the plan
             Map<String, Map<String, Object>> byBusiness = new HashMap<>();
-            List<Inserted> inserted = new ArrayList<>();
+            List<Inserted> inserted = new ArrayList<>(); // a sample per table, for the post-insert comparison
             Map<String, Map<String, Long>> counts = new LinkedHashMap<>();
             try (PreparedStatement audit = c.prepareStatement("INSERT INTO " + quote(AlterScriptGenerator.AUDIT_TABLE)
                     + " (RUN_ID, SOURCE_DB, TABLE_NAME, OLD_PK, NEW_PK, BUSINESS_KEY, ACTION) VALUES (?,?,?,?,?,?,?)")) {
                 for (TableStep step : plan.steps()) {
                     Map<String, Long> tc = new LinkedHashMap<>();
                     counts.put(step.table(), tc);
+                    long toInsert = step.count(RowAction.INSERT) + step.count(RowAction.INSERT_REMAPPED);
+                    int stride = (int) Math.max(1, (long) Math.ceil(toInsert / (double) SAMPLE_PER_TABLE));
+                    long insertNo = 0;
+                    int pending = 0;
+                    InsertBatch batch = batchable(plan, step) ? new InsertBatch(c) : null;
+                    long[] remapsLeft = {step.count(RowAction.INSERT_REMAPPED)};
+                    try {
                     for (PlannedRow r : step.rows()) {
-                        Map<String, Object> pk = apply(c, schema, plan.effectiveTables().get(step.table()), step, r, keyMap, byBusiness, inserted);
+                        boolean isInsert = r.action() == RowAction.INSERT || r.action() == RowAction.INSERT_REMAPPED;
+                        boolean sample = isInsert && insertNo++ % stride == 0;
+                        if (batch != null && !isInsert) batch.flush();
+                        Map<String, Object> pk = apply(c, schema, plan.effectiveTables().get(step.table()), step, r, keyMap, byBusiness,
+                                sample ? inserted : null, batch, sequences, remapsLeft);
                         if (pk != null) {
-                            keyMap.put(r.sourceDb() + "|" + step.table() + "|" + r.oldKey(), pk);
-                            byBusiness.putIfAbsent(step.table() + "|" + r.businessKey(), pk);
+                            if (referenced.contains(step.table())) keyMap.put(r.sourceDb(), step.table(), r.oldKey(), pk);
+                            if (r.masterPk() == null && isInsert) byBusiness.putIfAbsent(step.table() + "|" + r.businessKey(), pk);
                         }
                         tc.merge(r.action().name(), 1L, Long::sum);
                         audit.setString(1, run);
@@ -123,6 +212,10 @@ public class MergeExecutor {
                         audit.setString(6, trunc(r.businessKey(), 1000));
                         audit.setString(7, r.action().name());
                         audit.addBatch();
+                        if (++pending == 1000) { audit.executeBatch(); pending = 0; }
+                    }
+                    } finally {
+                        if (batch != null) batch.close(); // writes the table's last batch before the next table starts
                     }
                     log(log, step.table() + ": " + tc);
                 }
@@ -164,20 +257,28 @@ public class MergeExecutor {
     // ------------------------------------------------------------------ rows
 
     /** Applies one planned row; returns the master primary key the row now corresponds to (null if unknown). */
-    private Map<String, Object> apply(Connection c, String schema, TableDef def, TableStep step, PlannedRow r, Map<String, Map<String, Object>> keyMap,
-                                      Map<String, Map<String, Object>> byBusiness, List<Inserted> inserted) throws SQLException {
+    private Map<String, Object> apply(Connection c, String schema, TableDef def, TableStep step, PlannedRow r, KeyMap keyMap,
+                                      Map<String, Map<String, Object>> byBusiness, List<Inserted> inserted, InsertBatch batch,
+                                      SequencePool sequences, long[] remapsLeft) throws SQLException {
         switch (r.action()) {
             case INSERT, INSERT_REMAPPED -> {
                 Map<String, Object> vals = resolve(r.values(), keyMap);
                 boolean seq = r.action() == RowAction.INSERT_REMAPPED && step.pkMode() == PkMode.SEQUENCE;
                 String pkCol = step.pkColumns().size() == 1 ? step.pkColumns().get(0) : null;
-                if (seq) vals.put(pkCol, nextVal(c, schema, step.sequence()));
+                if (seq) vals.put(pkCol, sequences.next(c, schema, step.sequence(), remapsLeft[0]--));
                 List<String> cols = new ArrayList<>(vals.keySet());
                 List<String> placeholders = new ArrayList<>();
                 for (String col : cols) placeholders.add(placeholder(def, col, vals.get(col)));
                 String sql = "INSERT INTO " + qualified(schema, step.table()) + " (" + columnList(cols) + ") VALUES ("
                         + String.join(",", placeholders) + ")";
                 Map<String, Object> pk = new LinkedHashMap<>();
+                if (batch != null) {
+                    bind(batch.statementFor(sql), def, cols, vals);
+                    batch.added();
+                    for (String k : step.pkColumns()) pk.put(k, vals.get(k));
+                    if (inserted != null) inserted.add(new Inserted(step, r, pk));
+                    return pk;
+                }
                 try (PreparedStatement ps = pkCol != null ? c.prepareStatement(sql, new String[] {pkCol}) : c.prepareStatement(sql)) {
                     bind(ps, def, cols, vals);
                     ps.executeUpdate();
@@ -188,7 +289,7 @@ public class MergeExecutor {
                     }
                 }
                 if (pk.isEmpty()) for (String k : step.pkColumns()) pk.put(k, vals.get(k));
-                inserted.add(new Inserted(step, r, pk));
+                if (inserted != null) inserted.add(new Inserted(step, r, pk));
                 return pk;
             }
             case UPDATE -> {
@@ -223,12 +324,12 @@ public class MergeExecutor {
         return m;
     }
 
-    private static Map<String, Object> resolve(Map<String, Object> values, Map<String, Map<String, Object>> keyMap) {
+    private static Map<String, Object> resolve(Map<String, Object> values, KeyMap keyMap) {
         Map<String, Object> out = new LinkedHashMap<>();
         for (var e : values.entrySet()) {
             Object v = e.getValue();
             if (v instanceof FkRef f) {
-                Map<String, Object> target = keyMap.get(f.sourceDb() + "|" + f.parentTable() + "|" + f.oldKey());
+                Map<String, Object> target = keyMap.get(f.sourceDb(), f.parentTable(), f.oldKey());
                 if (target == null || !target.containsKey(f.parentColumn()) || target.get(f.parentColumn()) == null) {
                     throw new IllegalStateException("Parent key not available for " + f.parentTable() + " " + f.oldKey() + " from " + f.sourceDb());
                 }
@@ -257,13 +358,6 @@ public class MergeExecutor {
         return i;
     }
 
-    private static Object nextVal(Connection c, String schema, String seq) throws SQLException {
-        try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery("SELECT " + qualified(schema, seq) + ".NEXTVAL FROM dual")) {
-            rs.next();
-            return rs.getBigDecimal(1);
-        }
-    }
-
     // ------------------------------------------------------------ validation
 
     private List<ValidationResult> validate(Connection c, String schema, MergePlan plan, Map<String, Long> baseline, List<Inserted> inserted)
@@ -284,14 +378,10 @@ public class MergeExecutor {
                     e.getValue() + " orphan row(s) after, " + before + " before the merge"));
         }
         Map<String, Integer> sampled = new HashMap<>();
-        Map<String, Integer> seen = new HashMap<>();
         Map<String, Integer> bad = new HashMap<>();
         Map<String, String> firstBad = new HashMap<>();
-        for (Inserted in : inserted) {
+        for (Inserted in : inserted) { // already a sample: about SAMPLE_PER_TABLE inserted rows per table
             String t = in.step().table();
-            int n = seen.merge(t, 1, Integer::sum);
-            int stride = Math.max(1, (int) Math.ceil(in.step().rows().size() / (double) SAMPLE_PER_TABLE));
-            if ((n - 1) % stride != 0) continue;
             sampled.merge(t, 1, Integer::sum);
             String diff = compareRow(c, schema, in);
             if (diff != null) { bad.merge(t, 1, Integer::sum); firstBad.putIfAbsent(t, in.row().businessKey() + ": " + diff); }

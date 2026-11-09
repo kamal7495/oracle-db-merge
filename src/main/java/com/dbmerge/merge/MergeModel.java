@@ -33,7 +33,7 @@ public final class MergeModel {
      * Placeholder inside a row's values: "the value of parentColumn in the master row that source parent (oldKey)
      * ended up as". Resolved by the executor from the key mapping built while loading parents first.
      */
-    public record FkRef(String parentTable, String sourceDb, String oldKey, String parentColumn) { }
+    public record FkRef(String parentTable, String sourceDb, String oldKey, String parentColumn) implements java.io.Serializable { }
 
     public record PlannedRow(
             String sourceDb,
@@ -43,7 +43,7 @@ public final class MergeModel {
             Map<String, Object> values,          // master column -> typed value or FkRef
             List<Object> masterPk,               // INSERT/KEEP: the key; MATCHED: key of the master row; null => allocate at run time
             List<String> changedColumns,         // UPDATE only
-            String note) { }
+            String note) implements java.io.Serializable { }
 
     public record TableStep(
             String table,
@@ -56,6 +56,7 @@ public final class MergeModel {
             List<PlannedRow> rows) {
 
         public long count(RowAction a) {
+            if (rows instanceof SpooledRows spooled) return spooled.count(a); // no need to read the plan file
             return rows.stream().filter(r -> r.action() == a).count();
         }
     }

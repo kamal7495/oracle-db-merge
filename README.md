@@ -8,7 +8,7 @@ Compare and merge **N Oracle databases into one master**. Java 17, Maven, `ojdbc
 * **Undeclared references** – for one schema, list the columns that act like foreign keys but have no FOREIGN KEY constraint, optionally checked against the data. Run this before merging a schema whose integrity lives in the application (typical of vendor packages such as trading systems).
 
 > **Status of this build – read this first.**
-> `mvn verify` passes: the unit tests plus the Testcontainers integration tests against Oracle Free 23 (`SchemaExtractorIT`, `MergeIT`, `LobMergeIT`, `ReferenceIT`, `DataHashCompareIT`, `WebFlowIT`). These cover extraction, the Phase 2 comparison (in memory and by server-side hash), planning, executing, rolling back and validating merges (including BLOB/CLOB columns), the undeclared-reference detection with its data check, every REST endpoint (`WebApiTest`, no database), and the UI itself: `WebFlowIT` drives a complete merge through the page in headless Chromium.
+> `mvn verify` passes: the unit tests plus the Testcontainers integration tests against Oracle Free 23 (`SchemaExtractorIT`, `MergeIT`, `LobMergeIT`, `ReferenceIT`, `DataHashCompareIT`, `LargeMergeIT`, `WebFlowIT`). These cover extraction, the Phase 2 comparison (in memory and by server-side hash), planning, executing, rolling back and validating merges (including BLOB/CLOB columns), the undeclared-reference detection with its data check, every REST endpoint (`WebApiTest`, no database), and the UI itself: `WebFlowIT` drives a complete merge through the page in headless Chromium.
 > **Lightly covered:** the content of the Phase 2 Excel report and the merge reports (generated and downloaded in tests, not checked cell by cell).
 > **Do not point the executor at a real master before a dry run on a copy and a Data Pump backup.**
 
@@ -247,6 +247,45 @@ Limits: detection works from names, so it misses references whose names do not m
 6. **Schema differences → ALTER scripts**, shown for approval: audit table, missing tables (FKs/indexes after), missing columns, widened columns. Nothing is dropped or narrowed. New columns that the source marks NOT NULL without default are added as nullable.
 7. **Audit.** Instead of adding `SOURCE_DB/SOURCE_ID` columns to every business table, a separate audit table is used (above).
 
+### Large tables
+
+Tables up to `dbmerge.max-rows-per-table` (default 200 000 rows, in the master and every source) are planned in
+memory. **Larger tables are streamed**, so a merge is not limited by memory:
+
+* The master and every source are read **sorted by business key**, each in one read-only transaction, and walked side by
+  side. Each key's rows (the master row, then each source's rows in source order) go through **the same decision code**
+  as the in-memory path: duplicates, conflicts and rules, re-keying, foreign-key rewriting, orphans and constraint checks.
+  The sort is the same in Oracle and Java (`NLSSORT ... BINARY`, NULLs last) and is checked while reading: rows out of
+  order stop the plan rather than pair the wrong ones.
+* Memory holds one key group at a time, the primary keys in use (as primitive longs for numeric keys) and only the
+  source keys that change. Keys are kept only for tables that another table points at with a foreign key, and only
+  when a collision is possible.
+* The planned rows go to a **plan file** per table under `reports/plans/`, readable by the owner only, deleted once the
+  plan is executed or replaced (and at exit). The review script shows the first 1 000 statements of such a table.
+  The plan stays a read-only dry run: nothing is created in the master to plan.
+* The executor reads the plan file and **inserts in batches of 1 000** (also for small tables), fetching sequence values
+  in blocks. A table with an enabled trigger that stays active keeps row-by-row inserts, because a trigger may set the
+  key and only a single-row insert returns the key actually stored. Everything stays one transaction with the same
+  checks before commit.
+* `StreamingPlannerTest` plans every scenario both ways, including 300 random databases, and requires identical plans;
+  `LargeMergeIT` merges the sample schemas both ways on Oracle and requires identical masters.
+
+Limits of the streamed path: no **self-referencing** foreign key (parents must come before children inside the table;
+such a table over the limit is a blocker), the business-key columns must have **the same type** in every database, and
+when two sources bring different new rows with the same primary key, which one keeps it follows key order (the
+in-memory path now uses key order too, so re-keyed `MAX+1` numbers are the same both ways). Plan files take about
+300 bytes per row (1.5 GB for 5 million rows).
+
+Measured on the perf kit (MacBook, Colima VM with 4 CPUs and 6 GB, Oracle Free 23ai): merging `PERF_C` (1 million trades
+that the master does not have, with 3 million keywords, 1 million messages and 100 000 fees; static data identical)
+into `PERF_A`:
+
+| Step | Time | Result |
+|---|---|---|
+| Dry run (5.35 M source rows, 5.35 M master rows) | 139 s | 5.1 M inserts, 251 000 duplicates, no blockers |
+| Execute (5.1 M rows + 5.35 M `DBMERGE_ROW_MAP` rows, one transaction) | 97 s | committed; every row count, orphan and sample check passed |
+| Dry run again afterwards (with a 768 MB heap) | 74 s | everything a duplicate: a repeated merge changes nothing |
+
 ### Safety model
 
 * Dry run is the default and the only thing `/api/merge/plan` does.
@@ -266,7 +305,7 @@ Limits: detection works from names, so it misses references whose names do not m
 * Only NOT NULL, text length and type conversion are checked while planning. **UNIQUE constraints other than the business key, CHECK constraints** and other DB rules are not pre-validated: the database enforces them during the run and a violation rolls the whole data transaction back (the `MergeIT` rollback test uses this). Example: the business key is the PK and a source row brings a new ID with an e-mail the master already has.
 * Planning straight after a schema change (e.g. a run whose approved `CREATE TABLE` committed but whose data step rolled back) can hit `ORA-01466` because reads use `READ ONLY` transactions. Reads retry automatically for about 10 seconds.
 * Business-key columns should be natural columns (e-mail, SKU), **not foreign-key columns**: keys are compared on source values before FK rewriting.
-* The **merge** (Phase 3) is processed in memory (`max-rows-per-table`). Large tables need a different approach (staging tables / Data Pump / `MERGE`). Only the Phase 2 *comparison* handles large tables, with server-side hashes (see [How large tables are compared](#how-large-tables-are-compared)).
+* Large tables are merged in one transaction: Oracle keeps undo for every inserted row until the commit, so the undo tablespace must hold the whole merge (and long reads risk `ORA-01555`). See [Large tables](#large-tables) for the streamed path and its limits.
 * Hash comparisons of large tables run about six full scans per database. Under heavy write load a long read-only snapshot can hit `ORA-01555` (snapshot too old). Run them on a standby or a quiet period, or raise `UNDO_RETENTION`.
 * FK cycles between tables are blocked rather than solved.
 * **LOBs.** BLOB, CLOB and NCLOB are read whole, compared byte for byte / character for character, and written through bind variables. `LobMergeIT` covers 1–2 MB BLOBs, a 100 000-character Unicode CLOB, NULLs, empty LOBs (`EMPTY_BLOB()`/`EMPTY_CLOB()` stay empty, not NULL) and FK rewriting on tables with LOBs. Limits:
@@ -279,7 +318,7 @@ Limits: detection works from names, so it misses references whose names do not m
 
 ```bash
 mvn test      # unit tests (no database): comparator, registry, row matcher, FK graph, planner, script/alter generators, report writers, reference detector, REST API
-mvn verify    # also the Testcontainers integration tests (needs Docker): SchemaExtractorIT, MergeIT, LobMergeIT, ReferenceIT, DataHashCompareIT, WebFlowIT
+mvn verify    # also the Testcontainers integration tests (needs Docker): SchemaExtractorIT, MergeIT, LobMergeIT, ReferenceIT, DataHashCompareIT, LargeMergeIT, WebFlowIT
 ```
 
 * `WebApiTest` (unit, no database) calls every REST endpoint as the UI does, with schema extraction replaced by fixed
@@ -316,12 +355,13 @@ It is Calypso-like in shape only: names and data are made up.
   references by name (`TRADE.BOOK_ID`, `BOOK.LE_ID`), a role prefix (`ISSUER_LE_ID`), a 1:1 extension table sharing
   its key (`PRODUCT_BOND`), a type + ID pair (`BO_MESSAGE.OBJECT_ID`/`OBJECT_CLASS`), an ID with no table (`CPTY_ID`).
   It also has views, a package, a function, a synonym, grants, and `BKP_`/`TMP_` leftovers.
-* `trading_data.sql N`: N trades, 3 keywords and 1 message each, 1 fee per 10, plus 200 000 products and 5 000 legal
+* `trading_data.sql N OFFSET`: N trades (ids from OFFSET + 1), 3 keywords and 1 message each, 1 fee per 10, plus 200 000 products and 5 000 legal
   entities, generated inside the database. For N = 1 000 000 that is 5.35 million rows per schema.
 * `drift_b.sql N`: makes `PERF_B` differ in countable ways: prices changed on 1 trade in 1 000, 1 in 5 000 deleted
   with its children, 100 new trades, 1 in 2 000 desk keywords changed, a new column, a changed package body, a
   dropped view, a missing grant and an extra backup table.
-* `setup.sh [N] [container]` creates `PERF_A`/`PERF_B` and loads both (about 80 s for 1 million trades on the Colima
+* `setup.sh [N] [container]` creates `PERF_A`/`PERF_B` (near copies, for comparisons) and `PERF_C` (the same static data
+  but N other trades, for merging at scale) and loads them (about 80 s for 1 million trades on the Colima
   container). It needs `ORACLE_PASSWORD` (SYSTEM) and `DBMERGE_PERF_PASSWORD`. Passwords go to the container by
   variable name and reach sqlplus on stdin, never as process arguments.
 * `run.sh [out]` times each command-line comparison against them and records peak memory.

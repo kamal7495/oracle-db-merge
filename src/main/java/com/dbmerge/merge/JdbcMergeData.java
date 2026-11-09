@@ -36,6 +36,57 @@ public class JdbcMergeData implements MergePlanner.MergeData {
         return ReadOnlyRetry.call(() -> load(db, table, columns, sql));
     }
 
+    @Override
+    public long count(String db, String table) throws SQLException {
+        String sql = "SELECT COUNT(*) FROM " + qualified(connections.schemaOf(db), table);
+        return ReadOnlyRetry.call(() -> {
+            try (Connection c = connections.openReadOnly(db); Statement st = c.createStatement(); ResultSet rs = st.executeQuery(sql)) {
+                rs.next();
+                return rs.getLong(1);
+            }
+        });
+    }
+
+    /**
+     * Streams the table in key order on its own read-only connection, kept open until the cursor is closed, so the
+     * whole table is read in one consistent snapshot. Memory stays at one fetch (1000 rows).
+     */
+    @Override
+    public MergePlanner.RowCursor sorted(String db, String table, List<String> columns, List<String> key, KeyOrder order)
+            throws SQLException {
+        String sql = "SELECT " + columnList(columns) + " FROM " + qualified(connections.schemaOf(db), table) + order.orderBy();
+        return ReadOnlyRetry.call(() -> {
+            Connection c = connections.openReadOnly(db);
+            Statement st = null;
+            try {
+                st = c.createStatement();
+                st.setFetchSize(1000);
+                ResultSet rs = st.executeQuery(sql);
+                ResultSetMetaData md = rs.getMetaData();
+                int[] types = new int[columns.size()];
+                for (int i = 0; i < types.length; i++) types[i] = md.getColumnType(i + 1);
+                Statement stmt = st;
+                return new MergePlanner.RowCursor() {
+                    @Override
+                    public Map<String, Object> next() throws SQLException {
+                        if (!rs.next()) return null;
+                        Map<String, Object> row = new LinkedHashMap<>();
+                        for (int i = 0; i < types.length; i++) row.put(columns.get(i), read(rs, i + 1, types[i]));
+                        return row;
+                    }
+
+                    @Override
+                    public void close() throws SQLException {
+                        try { rs.close(); stmt.close(); } finally { c.close(); }
+                    }
+                };
+            } catch (SQLException | RuntimeException e) {
+                try { if (st != null) st.close(); } finally { c.close(); }
+                throw e;
+            }
+        });
+    }
+
     private List<Map<String, Object>> load(String db, String table, List<String> columns, String sql) throws SQLException {
         List<Map<String, Object>> out = new ArrayList<>();
         try (Connection c = connections.openReadOnly(db);

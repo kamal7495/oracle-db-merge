@@ -49,9 +49,11 @@ public class MergeService {
             throws SQLException, IOException {
         Map<String, SchemaModel> models = new LinkedHashMap<>();
         for (SchemaModel m : ddl.models()) models.put(m.nickname(), m);
-        MergePlan plan = new MergePlanner(new JdbcMergeData(connections, maxRows)).plan(master, sources, models, keys, ruleStore.get(), options);
+        // Tables above maxRows are streamed and their plan kept in files under reports/plans (owner-only).
+        MergePlan plan = new MergePlanner(new JdbcMergeData(connections, maxRows), maxRows, reportsDir.resolve("plans"))
+                .plan(master, sources, models, keys, ruleStore.get(), options);
         plans.put(plan.id(), plan);
-        while (plans.size() > KEEP) plans.remove(plans.keySet().iterator().next());
+        while (plans.size() > KEEP) discard(plans.remove(plans.keySet().iterator().next()));
         Files.createDirectories(reportsDir);
         Files.writeString(reportsDir.resolve("merge-" + plan.id() + ".html"), reports.renderPlan(plan), StandardCharsets.UTF_8);
         Files.writeString(reportsDir.resolve("merge-" + plan.id() + ".sql"), ScriptRenderer.render(plan, allAlterIds(plan)), StandardCharsets.UTF_8);
@@ -72,11 +74,19 @@ public class MergeService {
         }
         if (executed.contains(planId)) return refuse(plan, "This plan was already executed. Run a new dry run.");
         MergeResult result = new MergeExecutor(connections).execute(plan, approvedAlters == null ? Set.of() : approvedAlters);
-        if (result.status() != RunStatus.REFUSED) executed.add(planId);
+        if (result.status() != RunStatus.REFUSED) {
+            executed.add(planId);
+        }
         Files.createDirectories(reportsDir);
         Files.writeString(reportsDir.resolve("merge-" + plan.id() + "-final.html"), reports.renderResult(plan, result), StandardCharsets.UTF_8);
         Files.writeString(reportsDir.resolve("merge-" + plan.id() + "-final.txt"), String.join("\n", result.log()), StandardCharsets.UTF_8);
+        if (executed.contains(planId)) discard(plan); // a plan runs once; its rows are not needed any more
         return result;
+    }
+
+    /** Deletes a plan's files (large tables); the plan cannot be read or run afterwards. */
+    private static void discard(MergePlan plan) {
+        for (var s : plan.steps()) if (s.rows() instanceof SpooledRows spooled) spooled.delete();
     }
 
     private MergeResult refuse(MergePlan plan, String why) {

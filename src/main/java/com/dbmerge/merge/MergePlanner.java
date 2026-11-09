@@ -48,15 +48,52 @@ public class MergePlanner {
     /** Typed row access. Implemented over JDBC in production and over in-memory lists in tests. */
     public interface MergeData {
         List<Map<String, Object>> rows(String db, String table, List<String> columns) throws SQLException;
+
+        /** Number of rows; decides whether a table is planned in memory or streamed. */
+        default long count(String db, String table) throws SQLException {
+            return rows(db, table, List.of()).size();
+        }
+
+        /** Rows ordered by {@code key} as {@link KeyOrder} orders them (NULLs last), read one at a time. */
+        default RowCursor sorted(String db, String table, List<String> columns, List<String> key, KeyOrder order) throws SQLException {
+            List<Map<String, Object>> all = new ArrayList<>(rows(db, table, columns));
+            all.sort((a, b) -> order.compare(order.keyOf(a), order.keyOf(b)));
+            java.util.Iterator<Map<String, Object>> it = all.iterator();
+            return new RowCursor() {
+                @Override public Map<String, Object> next() { return it.hasNext() ? it.next() : null; }
+                @Override public void close() { }
+            };
+        }
+    }
+
+    /** A forward-only stream of rows; {@link #next()} returns null at the end. */
+    public interface RowCursor extends AutoCloseable {
+        Map<String, Object> next() throws SQLException;
+
+        @Override
+        void close() throws SQLException;
     }
 
     private static final Pattern NEXTVAL = Pattern.compile("(?i)(?:\"?[A-Z0-9_$#]+\"?\\.)?\"?([A-Z0-9_$#]+)\"?\\s*\\.\\s*NEXTVAL");
     private static final int EXAMPLES = 5;
 
     private final MergeData data;
+    private final long streamAbove;
+    private final java.nio.file.Path spoolDir;
 
+    /** Plans every table in memory. */
     public MergePlanner(MergeData data) {
+        this(data, Long.MAX_VALUE, null);
+    }
+
+    /**
+     * @param streamAbove tables with more rows than this (in the master or any source) are streamed in key order and
+     *                    their plan kept in a file under {@code spoolDir}; smaller ones are planned in memory
+     */
+    public MergePlanner(MergeData data, long streamAbove, java.nio.file.Path spoolDir) {
         this.data = data;
+        this.streamAbove = streamAbove;
+        this.spoolDir = spoolDir != null ? spoolDir : java.nio.file.Path.of(System.getProperty("java.io.tmpdir"), "dbmerge-plans");
     }
 
     private static final class VRow {
@@ -113,14 +150,15 @@ public class MergePlanner {
                     + "(parents must exist before children). Merge them manually or break the cycle first."));
         }
 
-        Map<String, Map<String, Object>> idMap = new LinkedHashMap<>();
-        Map<String, Set<String>> pkSets = new LinkedHashMap<>();
+        KeyMap idMap = new KeyMap(eff);
+        Map<String, KeySet> pkSets = new LinkedHashMap<>();
+        Set<String> referenced = referencedTables(mergeTables);
         Set<String> tablesWithSourceRows = new HashSet<>();
         List<TableStep> steps = new ArrayList<>();
         for (String table : graph.order()) {
             if (skipped.contains(table)) continue;
             TableStep step = planTable(table, eff, mergeTables, mm, sms, master, keyOverrides.get(table), rules, options,
-                    idMap, pkSets, tablesWithSourceRows, issues);
+                    idMap, pkSets, tablesWithSourceRows, issues, referenced.contains(table));
             steps.add(step);
         }
         // Needs the finished plan: it compares copied child values with the parents' changed keys.
@@ -145,8 +183,8 @@ public class MergePlanner {
 
     private TableStep planTable(String table, Map<String, TableDef> eff, Map<String, TableDef> mergeTables, SchemaModel mm,
                                 List<SchemaModel> sms, String master, List<String> keyOverride, Rules rules, Options options,
-                                Map<String, Map<String, Object>> idMap, Map<String, Set<String>> pkSets,
-                                Set<String> tablesWithSourceRows, List<Issue> issues) throws SQLException {
+                                KeyMap idMap, Map<String, KeySet> pkSets,
+                                Set<String> tablesWithSourceRows, List<Issue> issues, boolean referenced) throws SQLException {
         TableDef def = eff.get(table);
         TableDef actualMaster = mm.tables().get(table);
         List<String> allCols = def.columns().values().stream().filter(c -> !c.virtual()).map(ColumnDef::name).toList();
@@ -168,9 +206,18 @@ public class MergePlanner {
             return new TableStep(table, key, pkCols, allCols, PkMode.NONE, null, 0, rows);
         }
 
+        if (streamAbove != Long.MAX_VALUE) {
+            long biggest = actualMaster == null ? 0 : data.count(master, table);
+            for (SchemaModel s : srcWith) biggest = Math.max(biggest, data.count(s.nickname(), table));
+            if (biggest > streamAbove) {
+                return planLargeTable(table, def, actualMaster, allCols, masterCols, newCols, pkCols, key, srcWith, mm, master,
+                        rules, options, idMap, pkSets, tablesWithSourceRows, mergeTables, issues, biggest, referenced);
+            }
+        }
+
         // Existing master rows
         List<Map<String, Object>> masterRows = actualMaster == null ? List.of() : data.rows(master, table, masterCols);
-        Set<String> used = new HashSet<>();
+        KeySet used = new KeySet();
         Map<String, VRow> vm = new LinkedHashMap<>();
         BigDecimal maxPk = BigDecimal.ZERO;
         for (Map<String, Object> r : masterRows) {
@@ -179,7 +226,7 @@ public class MergePlanner {
             maxPk = maxPk.max(numericPk(r, pkCols));
             vm.put(Canon.key(r, key), new VRow(new LinkedHashMap<>(r), pk, -1));
         }
-        pkSets.put(table, new HashSet<>(used));
+        pkSets.put(table, used.copy());
 
         // Primary-key strategy
         String sequence = null;
@@ -217,15 +264,24 @@ public class MergePlanner {
         if (!newCols.isEmpty() && !srcRows.isEmpty()) {
             issues.add(new Issue(Level.INFO, table, "Columns " + newCols + " do not exist in the master yet; they are filled only for newly inserted rows."));
         }
+        // Business-key order, as the streaming path reads them: re-keyed rows get MAX+1 numbers in a fixed order
+        // (databases return rows in no particular order), and both paths number them alike.
+        KeyOrder order = new KeyOrder(key, key.stream().map(c -> def.columns().get(c)).toList());
+        for (var e : srcRows.entrySet()) {
+            List<Map<String, Object>> sorted = new ArrayList<>(e.getValue());
+            sorted.sort((a, b) -> order.compare(order.keyOf(a), order.keyOf(b)));
+            e.setValue(sorted);
+        }
 
-        Map<String, Integer> violations = new LinkedHashMap<>();
-        Map<String, String> violationExample = new LinkedHashMap<>();
-        int orphanCount = 0;
-        List<String> orphanExamples = new ArrayList<>();
-        BigDecimal nextPk = maxPk;
-
-        List<FkInfo> fks = foreignKeys(def, mergeTables);
+        Ctx x = new Ctx(table, def, key, pkCols, newCols, pkMode, sequence, rules, options, idMap, pkSets, issues);
+        x.referenced = referenced;
+        x.used = keysOf(used);
+        x.nextPk = maxPk;
+        x.fks = foreignKeys(def, mergeTables);
         List<ConstraintDef> selfFks = def.constraints().stream().filter(c -> c.type().equals("R") && table.equals(c.refTable())).toList();
+        x.rows = new ListSink(rows);
+        x.vmGet = vm::get;
+        x.vmPut = vm::put;
 
         for (var entry : srcRows.entrySet()) {
             String src = entry.getKey();
@@ -233,193 +289,510 @@ public class MergePlanner {
             List<Map<String, Object>> ordered = orderBySelfReference(entry.getValue(), selfFks, pkCols, table, issues);
             Set<String> sourcePkSet = new HashSet<>();
             for (Map<String, Object> r : entry.getValue()) sourcePkSet.add(Canon.key(r, pkCols));
+            x.sourcePkSet = sourcePkSet::contains;
+            for (Map<String, Object> row : ordered) processRow(x, src, cols, row);
+        }
 
-            for (Map<String, Object> row : ordered) {
-                String oldKey = Canon.key(row, pkCols.isEmpty() ? key : pkCols);
-                String bkey = Canon.key(row, key);
-                String bdisplay = Canon.display(bkey, key);
-                Map<String, Object> vals = new LinkedHashMap<>();
-                Map<String, Object> cmp = new LinkedHashMap<>();
-                for (String c : cols) {
-                    Object v = coerce(row.get(c), def.columns().get(c), table, issues);
-                    vals.put(c, v);
-                    cmp.put(c, v);
-                }
+        finishTable(x);
+        return new TableStep(table, key, pkCols, allCols, pkMode, sequence, masterRows.size(), rows);
+    }
 
-                // Rewrite foreign keys through the key mapping of the (already planned) parents.
-                boolean orphan = false;
-                for (FkInfo fk : fks) {
-                    if (!cols.containsAll(fk.columns)) continue;
-                    List<Object> raw = new ArrayList<>();
-                    for (String c : fk.columns) raw.add(row.get(c));
-                    if (raw.stream().anyMatch(java.util.Objects::isNull)) continue;
-                    if (!fk.pkReference) continue;                      // references non-PK columns: copied as is
-                    Map<String, Object> asParentRow = new LinkedHashMap<>();
-                    for (int i = 0; i < fk.columns.size(); i++) asParentRow.put(fk.refColumns.get(i), raw.get(i));
-                    String oldParent = Canon.key(asParentRow, fk.parentPk);
-                    String mk = src + "|" + fk.parent + "|" + oldParent;
-                    Map<String, Object> target = idMap.get(mk);
-                    if (target != null) {
-                        for (int i = 0; i < fk.columns.size(); i++) {
-                            vals.put(fk.columns.get(i), new FkRef(fk.parent, src, oldParent, fk.refColumns.get(i)));
-                            Object concrete = target.get(fk.refColumns.get(i));
-                            cmp.put(fk.columns.get(i), concrete != null ? concrete : "\u0000SYMBOLIC:" + mk);
-                        }
-                    } else if (!tablesWithSourceRowsFrom(idMap, src, fk.parent) && pkSets.getOrDefault(fk.parent, Set.of()).contains(oldParent)) {
-                        // parent lives only in the master and the key exists there: reference stays valid
-                    } else if (table.equals(fk.parent) && sourcePkSet.contains(oldParent)) {
-                        // self reference to a row that could not be ordered earlier (reported by orderBySelfReference)
-                    } else {
-                        orphan = true;
-                    }
-                }
-                if (orphan) {
-                    orphanCount++;
-                    if (orphanExamples.size() < EXAMPLES) orphanExamples.add(src + " " + bdisplay);
-                    rows.add(new PlannedRow(src, RowAction.SKIP_ORPHAN, oldKey, bdisplay, vals, null, List.of(), "parent row not found"));
-                    continue;
-                }
+    // ------------------------------------------------------------ large tables
 
-                VRow ex = vm.get(bkey);
-                if (ex == null) {
-                    // ---- new row
-                    boolean collision = !pkCols.isEmpty() && used.contains(Canon.key(row, pkCols));
-                    RowAction action = RowAction.INSERT;
-                    Map<String, Object> pk = pkMap(vals, pkCols);
-                    String note = null;
-                    if (collision) {
-                        switch (pkMode) {
-                            case SEQUENCE -> {
-                                action = RowAction.INSERT_REMAPPED;
-                                pk = Map.of();
-                                vals.put(pkCols.get(0), null);
-                                note = "primary key " + oldKey + " already used; new key from sequence " + sequence;
-                            }
-                            case MAX_PLUS_ONE -> {
-                                nextPk = nextPk.add(BigDecimal.ONE);
-                                action = RowAction.INSERT_REMAPPED;
-                                Object nv = nextPk;
-                                vals.put(pkCols.get(0), nv);
-                                pk = new LinkedHashMap<>();
-                                pk.put(pkCols.get(0), nv);
-                                note = "primary key " + oldKey + " already used; new key " + nextPk.toPlainString() + " (no sequence found, max+1)";
-                                used.add(Canon.key(vals, pkCols));
-                            }
-                            default -> {
-                                issues.add(new Issue(Level.BLOCKER, table, "Primary key collision for " + bdisplay + " from " + src
-                                        + " cannot be re-keyed automatically (composite or non-numeric key without a sequence)."));
-                                rows.add(new PlannedRow(src, RowAction.UNRESOLVED_CONFLICT, oldKey, bdisplay, vals, null, List.of(), "key collision"));
-                                continue;
-                            }
-                        }
-                    } else if (!pkCols.isEmpty()) {
-                        used.add(Canon.key(row, pkCols));
-                    }
-                    List<Object> masterPk = pk.isEmpty() ? null : new ArrayList<>(pk.values());
-                    collectViolations(def, vals, table, violations, violationExample, src + " " + bdisplay);
-                    rows.add(new PlannedRow(src, action, oldKey, bdisplay, vals, masterPk, List.of(), note));
-                    idMap.put(src + "|" + table + "|" + oldKey, pk);
-                    Map<String, Object> cmpWithPk = new LinkedHashMap<>(cmp);
-                    cmpWithPk.putAll(pk);
-                    vm.put(bkey, new VRow(cmpWithPk, pk, rows.size() - 1));
-                    continue;
-                }
+    /** Thrown when a stream is not in the order {@link KeyOrder} expects: the plan stops rather than pair wrong rows. */
+    private static final class OutOfOrder extends RuntimeException {
+        OutOfOrder(String message) { super(message, null, false, false); }
+    }
 
-                // ---- existing row (master or inserted earlier in this run)
-                List<String> differing = new ArrayList<>();
-                for (String c : cols) {
-                    if (pkCols.contains(c) || newCols.contains(c)) continue;
-                    if (!Canon.sameValue(cmp.get(c), ex.values.get(c))) differing.add(c);
-                }
-                String mapKey = src + "|" + table + "|" + oldKey;
-                if (differing.isEmpty()) {
-                    idMap.put(mapKey, ex.pk);
-                    rows.add(new PlannedRow(src, RowAction.SKIP_DUPLICATE, oldKey, bdisplay, Map.of(), listOf(ex.pk), List.of(), "identical to existing row"));
-                    continue;
-                }
-                Rules.RowDecision rd = rules.rowDecision(table, bdisplay);
-                Rules.TableRule tr = rules.tableRule(table);
-                ConflictAction action = rd != null ? rd.getAction() : tr != null ? tr.getAction() : null;
-                if (action == null) {
-                    rows.add(new PlannedRow(src, RowAction.UNRESOLVED_CONFLICT, oldKey, bdisplay, subset(vals, differing), listOf(ex.pk), differing,
-                            "differs from existing row in " + differing + "; choose keep master / take source / newest / manual"));
-                    idMap.put(mapKey, ex.pk);
-                    continue;
-                }
-                Map<String, Object> change = new LinkedHashMap<>();
-                String why = null;
-                if (action == ConflictAction.NEWEST) {
-                    String dc = tr == null ? null : tr.getDateColumn();
-                    if (dc == null || !cols.contains(dc)) {
-                        rows.add(new PlannedRow(src, RowAction.UNRESOLVED_CONFLICT, oldKey, bdisplay, subset(vals, differing), listOf(ex.pk), differing,
-                                "'newest' needs a date column that exists in the table"));
-                        idMap.put(mapKey, ex.pk);
-                        continue;
-                    }
-                    action = newer(cmp.get(dc), ex.values.get(dc)) ? ConflictAction.TAKE_SOURCE : ConflictAction.KEEP_MASTER;
-                    why = "newest by " + dc + ": " + (action == ConflictAction.TAKE_SOURCE ? src : "existing row") + " wins";
-                }
-                switch (action) {
-                    case KEEP_MASTER -> {
-                        rows.add(new PlannedRow(src, RowAction.SKIP_KEEP_MASTER, oldKey, bdisplay, Map.of(), listOf(ex.pk), differing,
-                                why != null ? why : "conflict resolved: keep master"));
-                        idMap.put(mapKey, ex.pk);
-                        continue;
-                    }
-                    case TAKE_SOURCE -> { for (String c : differing) change.put(c, vals.get(c)); }
-                    case MANUAL -> {
-                        if (rd == null || rd.getManualValues().isEmpty()) {
-                            rows.add(new PlannedRow(src, RowAction.UNRESOLVED_CONFLICT, oldKey, bdisplay, subset(vals, differing), listOf(ex.pk), differing,
-                                    "manual decision without values"));
-                            idMap.put(mapKey, ex.pk);
-                            continue;
-                        }
-                        for (var m : rd.getManualValues().entrySet()) {
-                            ColumnDef cd = def.columns().get(m.getKey());
-                            if (cd == null) throw new IllegalArgumentException("Manual value for unknown column " + m.getKey() + " in " + table);
-                            change.put(m.getKey(), Canon.convert(m.getValue(), cd));
-                        }
-                    }
-                    default -> throw new IllegalStateException("unreachable");
-                }
-                idMap.put(mapKey, ex.pk);
-                if (ex.stepRowIndex < 0 && pkCols.isEmpty()) {
-                    rows.add(new PlannedRow(src, RowAction.UNRESOLVED_CONFLICT, oldKey, bdisplay, subset(vals, differing), null, differing,
-                            "table has no primary key, so an existing row cannot be updated; choose keep master"));
-                    continue;
-                }
-                if (ex.stepRowIndex >= 0) {
-                    // The target row is being inserted by this run: patch that planned insert instead of updating.
-                    PlannedRow planned = rows.get(ex.stepRowIndex);
-                    Map<String, Object> patched = new LinkedHashMap<>(planned.values());
-                    patched.putAll(change);
-                    rows.set(ex.stepRowIndex, new PlannedRow(planned.sourceDb(), planned.action(), planned.oldKey(), planned.businessKey(),
-                            patched, planned.masterPk(), planned.changedColumns(), (planned.note() == null ? "" : planned.note() + "; ")
-                            + "values from " + src + " applied (" + (why != null ? why : "conflict rule") + ")"));
-                    rows.add(new PlannedRow(src, RowAction.SKIP_DUPLICATE, oldKey, bdisplay, Map.of(), listOf(ex.pk), differing,
-                            "merged into row inserted from " + planned.sourceDb()));
-                } else {
-                    collectViolations(def, change, table, violations, violationExample, src + " " + bdisplay);
-                    rows.add(new PlannedRow(src, RowAction.UPDATE, oldKey, bdisplay, change, listOf(ex.pk), new ArrayList<>(change.keySet()),
-                            why != null ? why : "conflict resolved by rule"));
-                }
-                for (var c : change.entrySet()) ex.values.put(c.getKey(), c.getValue() instanceof FkRef ? "\u0000SYMBOLIC" : c.getValue());
+    /** One table's rows from one database, read in key order, with the order checked as it goes. */
+    private static final class Stream {
+        final String db;
+        final RowCursor cursor;
+        final KeyOrder order;
+        final String table;
+        Map<String, Object> row;
+        List<Object> key;
+
+        Stream(String db, RowCursor cursor, KeyOrder order, String table) throws SQLException {
+            this.db = db;
+            this.cursor = cursor;
+            this.order = order;
+            this.table = table;
+            advance();
+        }
+
+        void advance() throws SQLException {
+            List<Object> previous = key;
+            row = cursor.next();
+            key = row == null ? null : order.keyOf(row);
+            if (key != null && previous != null && order.compare(previous, key) > 0) {
+                throw new OutOfOrder(db + " returned " + table + " rows out of business-key order (" + previous + " before " + key
+                        + "): Oracle's ordering of the key columns does not match the planner's.");
             }
         }
+    }
 
-        if (orphanCount > 0) {
-            boolean skip = options.orphanPolicy() == OrphanPolicy.SKIP;
-            issues.add(new Issue(skip ? Level.WARNING : Level.BLOCKER, table, orphanCount + " row(s) reference a parent row that does not exist"
-                    + " (e.g. " + String.join("; ", orphanExamples) + ")." + (skip ? " They will be skipped." : " Fix the source data or set the orphan policy to SKIP.")));
+    /** Buffers one key group in front of the plan file, so a later source can still patch a row an earlier one inserted. */
+    private static final class GroupSink implements Sink {
+        final SpooledRows spool;
+        final List<PlannedRow> buffer = new ArrayList<>();
+        int base;
+
+        GroupSink(SpooledRows spool) { this.spool = spool; }
+
+        @Override public void add(PlannedRow r) { buffer.add(r); }
+        @Override public PlannedRow get(int i) { return buffer.get(local(i)); }
+        @Override public void set(int i, PlannedRow r) { buffer.set(local(i), r); }
+        @Override public int size() { return base + buffer.size(); }
+
+        private int local(int i) {
+            if (i < base) throw new IllegalStateException("row " + i + " was already written to the plan file");
+            return i - base;
         }
-        for (var v : violations.entrySet()) {
-            issues.add(new Issue(Level.BLOCKER, table, v.getValue() + " row(s) " + v.getKey() + " (e.g. " + violationExample.get(v.getKey()) + ")."));
+
+        void flush() {
+            for (PlannedRow r : buffer) spool.append(r);
+            base += buffer.size();
+            buffer.clear();
         }
-        if (sequence != null && rows.stream().anyMatch(r -> r.action() == RowAction.INSERT)) {
-            issues.add(new Issue(Level.WARNING, table, "Rows keep their source primary keys, so sequence " + sequence
+    }
+
+    /**
+     * Plans a table too large for memory. The master and every source are read in business-key order at the same time
+     * and walked side by side; each key's rows (master row, then each source's rows in source order) go through the same
+     * {@link #processRow} as the in-memory path. Memory holds one key group, the primary keys in use ({@link KeySet})
+     * and the keys that change ({@link KeyMap}); the planned rows go to a {@link SpooledRows} file.
+     *
+     * <p>Differences from the in-memory path: tables with a self-referencing foreign key are not supported (they need
+     * parents ordered before children within the table), the key columns must have the same type in every database
+     * (so all of them sort alike), and when two sources bring different new rows with the same primary key, which one
+     * keeps it follows business-key order rather than source order.
+     */
+    private TableStep planLargeTable(String table, TableDef def, TableDef actualMaster, List<String> allCols, List<String> masterCols,
+                                     Set<String> newCols, List<String> pkCols, List<String> key, List<SchemaModel> srcWith, SchemaModel mm,
+                                     String master, Rules rules, Options options, KeyMap idMap, Map<String, KeySet> pkSets,
+                                     Set<String> tablesWithSourceRows, Map<String, TableDef> mergeTables, List<Issue> issues,
+                                     long biggest, boolean referenced) throws SQLException {
+        TableStep none = new TableStep(table, key, pkCols, allCols, PkMode.NONE, null, 0, List.of());
+        if (def.constraints().stream().anyMatch(c -> c.type().equals("R") && table.equals(c.refTable()))) {
+            issues.add(new Issue(Level.BLOCKER, table, "Has " + biggest + " rows and a self-referencing foreign key. Large tables "
+                    + "(over " + streamAbove + " rows) are streamed in key order, which cannot put parent rows before their children "
+                    + "within the table. Merge it separately, or raise dbmerge.max-rows-per-table to plan it in memory."));
+            return none;
+        }
+        List<ColumnDef> keyTypes = new ArrayList<>();
+        for (String c : key) keyTypes.add(def.columns().get(c));
+        List<SchemaModel> withTable = new ArrayList<>(srcWith);
+        if (actualMaster != null) withTable.add(0, mm);
+        for (SchemaModel m : withTable) {
+            for (int i = 0; i < key.size(); i++) {
+                ColumnDef c = m.tables().get(table).columns().get(key.get(i));
+                if (c != null && keyTypes.get(i) != null && !c.baseType().equals(keyTypes.get(i).baseType())) {
+                    issues.add(new Issue(Level.BLOCKER, table, "Key column " + key.get(i) + " is " + c.displayType() + " in " + m.nickname()
+                            + " but " + keyTypes.get(i).displayType() + " in the merged table. A large table is streamed in key order, "
+                            + "which needs the same type everywhere; align the column types first."));
+                    return none;
+                }
+            }
+        }
+        KeyOrder order = new KeyOrder(key, keyTypes);
+
+        String sequence = null;
+        PkMode pkMode;
+        if (pkCols.isEmpty()) pkMode = PkMode.NONE;
+        else if (pkCols.size() == 1) {
+            sequence = findSequence(table, def, mm, options);
+            ColumnDef pc = def.columns().get(pkCols.get(0));
+            boolean numeric = pc != null && Set.of("NUMBER", "INTEGER", "FLOAT").contains(pc.baseType());
+            pkMode = sequence != null ? PkMode.SEQUENCE : numeric ? PkMode.MAX_PLUS_ONE : PkMode.KEEP_ONLY;
+        } else pkMode = PkMode.KEEP_ONLY;
+
+        Map<String, List<String>> srcCols = new LinkedHashMap<>();
+        for (SchemaModel s : srcWith) {
+            TableDef st = s.tables().get(table);
+            List<String> cols = allCols.stream().filter(c -> st.columns().containsKey(c)).toList();
+            if (!cols.containsAll(key) || !cols.containsAll(pkCols)) {
+                issues.add(new Issue(Level.BLOCKER, table, s.nickname() + " lacks key column(s) " + key + "; cannot match rows."));
+                continue;
+            }
+            for (String c : allCols) {
+                ColumnDef mc = def.columns().get(c);
+                if (!cols.contains(c) && !mc.nullable() && mc.defaultValue() == null && !mc.identity()) {
+                    issues.add(new Issue(Level.BLOCKER, table, "Column " + c + " is NOT NULL without default in the master but missing in " + s.nickname() + "."));
+                }
+            }
+            srcCols.put(s.nickname(), cols);
+        }
+        if (!newCols.isEmpty() && !srcCols.isEmpty()) {
+            issues.add(new Issue(Level.INFO, table, "Columns " + newCols + " do not exist in the master yet; they are filled only for newly inserted rows."));
+        }
+
+        // Primary keys already used in the master (and the highest numeric key anywhere, for MAX+1).
+        KeySet masterKeys = new KeySet();
+        BigDecimal maxPk = BigDecimal.ZERO;
+        // Master keys are needed to spot a new row whose primary key is taken (impossible when the business key is the
+        // primary key: such a row matches by key) and, for a table others point at, to accept references to master rows.
+        boolean needKeys = referenced || !new LinkedHashSet<>(key).equals(new LinkedHashSet<>(pkCols));
+        if (!pkCols.isEmpty() && (needKeys || pkMode == PkMode.MAX_PLUS_ONE)) {
+            List<ColumnDef> pkTypes = pkCols.stream().map(c -> def.columns().get(c)).toList();
+            KeyOrder pkOrder = new KeyOrder(pkCols, pkTypes);
+            if (actualMaster != null) {
+                try (RowCursor c = data.sorted(master, table, pkCols, pkCols, pkOrder)) {
+                    for (Map<String, Object> r = c.next(); r != null; r = c.next()) {
+                        if (needKeys) masterKeys.add(Canon.key(r, pkCols));
+                        maxPk = maxPk.max(numericPk(r, pkCols));
+                    }
+                }
+            }
+            if (pkMode == PkMode.MAX_PLUS_ONE) {
+                for (String src : srcCols.keySet()) {
+                    try (RowCursor c = data.sorted(src, table, pkCols, pkCols, pkOrder)) {
+                        for (Map<String, Object> r = c.next(); r != null; r = c.next()) maxPk = maxPk.max(numericPk(r, pkCols));
+                    }
+                }
+            }
+        }
+        pkSets.put(table, masterKeys);
+        KeySet inserted = new KeySet();
+
+        SpooledRows spool = new SpooledRows(spoolDir, table);
+        Ctx x = new Ctx(table, def, key, pkCols, newCols, pkMode, sequence, rules, options, idMap, pkSets, issues);
+        x.referenced = referenced;
+        x.used = new KeyUse() {
+            @Override public boolean contains(String k) { return masterKeys.contains(k) || inserted.contains(k); }
+            @Override public void add(String k) { if (needKeys && !masterKeys.contains(k)) inserted.add(k); }
+        };
+        x.nextPk = maxPk;
+        x.fks = foreignKeys(def, mergeTables);
+        GroupSink sink = new GroupSink(spool);
+        x.rows = sink;
+        Map<String, VRow> vm = new LinkedHashMap<>();
+        x.vmGet = vm::get;
+        x.vmPut = vm::put;
+
+        long masterCount = 0;
+        Stream masterStream = null;
+        List<Stream> sources = new ArrayList<>();
+        try {
+            if (actualMaster != null && !masterCols.isEmpty()) {
+                masterStream = new Stream(master, data.sorted(master, table, masterCols, key, order), order, table);
+            }
+            for (var e : srcCols.entrySet()) sources.add(new Stream(e.getKey(), data.sorted(e.getKey(), table, e.getValue(), key, order), order, table));
+            while (true) {
+                List<Object> min = null;
+                if (masterStream != null && masterStream.key != null) min = masterStream.key;
+                for (Stream st : sources) if (st.key != null && (min == null || order.compare(st.key, min) < 0)) min = st.key;
+                if (min == null) break;
+                vm.clear();
+                while (masterStream != null && masterStream.key != null && order.compare(masterStream.key, min) == 0) {
+                    Map<String, Object> r = masterStream.row;
+                    masterCount++;
+                    vm.put(Canon.key(r, key), new VRow(new LinkedHashMap<>(r), pkMap(r, pkCols), -1));
+                    masterStream.advance();
+                }
+                for (Stream st : sources) {
+                    while (st.key != null && order.compare(st.key, min) == 0) {
+                        processRow(x, st.db, srcCols.get(st.db), st.row);
+                        tablesWithSourceRows.add(table);
+                        st.advance();
+                    }
+                }
+                sink.flush();
+            }
+        } catch (OutOfOrder e) {
+            spool.finish().delete();
+            issues.add(new Issue(Level.BLOCKER, table, e.getMessage() + " The plan was stopped so no rows are paired wrongly."));
+            return none;
+        } finally {
+            SQLException first = null;
+            for (Stream st : sources) { try { st.cursor.close(); } catch (SQLException ex) { if (first == null) first = ex; } }
+            if (masterStream != null) { try { masterStream.cursor.close(); } catch (SQLException ex) { if (first == null) first = ex; } }
+            if (first != null) throw first;
+        }
+        spool.finish();
+        finishTable(x);
+        issues.add(new Issue(Level.INFO, table, "Large table (" + biggest + " rows in the largest copy): streamed in business-key order, "
+                + spool.size() + " planned row(s) kept in a plan file instead of memory."));
+        return new TableStep(table, key, pkCols, allCols, pkMode, sequence, masterCount, spool);
+    }
+
+    /** Issues collected while planning a table's rows: orphans, constraint violations, sequence advice. */
+    private static void finishTable(Ctx x) {
+        if (x.orphanCount > 0) {
+            boolean skip = x.options.orphanPolicy() == OrphanPolicy.SKIP;
+            x.issues.add(new Issue(skip ? Level.WARNING : Level.BLOCKER, x.table, x.orphanCount + " row(s) reference a parent row that does not exist"
+                    + " (e.g. " + String.join("; ", x.orphanExamples) + ")." + (skip ? " They will be skipped." : " Fix the source data or set the orphan policy to SKIP.")));
+        }
+        for (var v : x.violations.entrySet()) {
+            x.issues.add(new Issue(Level.BLOCKER, x.table, v.getValue() + " row(s) " + v.getKey() + " (e.g. " + x.violationExample.get(v.getKey()) + ")."));
+        }
+        if (x.sequence != null && x.keptSourceKey) {
+            x.issues.add(new Issue(Level.WARNING, x.table, "Rows keep their source primary keys, so sequence " + x.sequence
                     + " may later hand out a key that is already used. Advance it beyond MAX of the key after the merge (sequences are not altered automatically)."));
         }
-        return new TableStep(table, key, pkCols, allCols, pkMode, sequence, masterRows.size(), rows);
+    }
+
+    /**
+     * Decides one source row: the shared core of both planning paths (in memory, and streamed for large tables).
+     * {@code x} carries the table's state: which keys are used, where parents went, and how rows are looked up.
+     */
+    private static void processRow(Ctx x, String src, List<String> cols, Map<String, Object> row) {
+        String oldKey = Canon.key(row, x.pkCols.isEmpty() ? x.key : x.pkCols);
+        String bkey = Canon.key(row, x.key);
+        String bdisplay = Canon.display(bkey, x.key);
+        Map<String, Object> vals = new LinkedHashMap<>();
+        Map<String, Object> cmp = new LinkedHashMap<>();
+        for (String c : cols) {
+            Object v = coerce(row.get(c), x.def.columns().get(c), x.table, x.issues);
+            vals.put(c, v);
+            cmp.put(c, v);
+        }
+
+        // Rewrite foreign keys through the key mapping of the (already planned) parents.
+        boolean orphan = false;
+        for (FkInfo fk : x.fks) {
+            if (!cols.containsAll(fk.columns)) continue;
+            List<Object> raw = new ArrayList<>();
+            for (String c : fk.columns) raw.add(row.get(c));
+            if (raw.stream().anyMatch(java.util.Objects::isNull)) continue;
+            if (!fk.pkReference) continue;                      // references non-PK columns: copied as is
+            Map<String, Object> asParentRow = new LinkedHashMap<>();
+            for (int i = 0; i < fk.columns.size(); i++) asParentRow.put(fk.refColumns.get(i), raw.get(i));
+            String oldParent = Canon.key(asParentRow, fk.parentPk);
+            String mk = src + "|" + fk.parent + "|" + oldParent;
+            Map<String, Object> target = x.idMap.get(src, fk.parent, oldParent);
+            if (target != null) {
+                for (int i = 0; i < fk.columns.size(); i++) {
+                    vals.put(fk.columns.get(i), new FkRef(fk.parent, src, oldParent, fk.refColumns.get(i)));
+                    Object concrete = target.get(fk.refColumns.get(i));
+                    cmp.put(fk.columns.get(i), concrete != null ? concrete : "\u0000SYMBOLIC:" + mk);
+                }
+            } else if (!x.idMap.hasAny(src, fk.parent) && x.pkSets.containsKey(fk.parent) && x.pkSets.get(fk.parent).contains(oldParent)) {
+                // parent lives only in the master and the key exists there: reference stays valid
+            } else if (x.table.equals(fk.parent) && x.sourcePkSet.test(oldParent)) {
+                // self reference to a row that could not be ordered earlier (reported by orderBySelfReference)
+            } else {
+                orphan = true;
+            }
+        }
+        if (orphan) {
+            x.orphanCount++;
+            if (x.orphanExamples.size() < EXAMPLES) x.orphanExamples.add(src + " " + bdisplay);
+            x.rows.add(new PlannedRow(src, RowAction.SKIP_ORPHAN, oldKey, bdisplay, vals, null, List.of(), "parent row not found"));
+            return;
+        }
+
+        VRow ex = x.vmGet.apply(bkey);
+        if (ex == null) {
+            // ---- new row
+            boolean collision = !x.pkCols.isEmpty() && x.used.contains(Canon.key(row, x.pkCols));
+            RowAction action = RowAction.INSERT;
+            Map<String, Object> pk = pkMap(vals, x.pkCols);
+            String note = null;
+            if (collision) {
+                switch (x.pkMode) {
+                    case SEQUENCE -> {
+                        action = RowAction.INSERT_REMAPPED;
+                        pk = Map.of();
+                        vals.put(x.pkCols.get(0), null);
+                        note = "primary key " + oldKey + " already used; new key from sequence " + x.sequence;
+                    }
+                    case MAX_PLUS_ONE -> {
+                        x.nextPk = x.nextPk.add(BigDecimal.ONE);
+                        action = RowAction.INSERT_REMAPPED;
+                        Object nv = x.nextPk;
+                        vals.put(x.pkCols.get(0), nv);
+                        pk = new LinkedHashMap<>();
+                        pk.put(x.pkCols.get(0), nv);
+                        note = "primary key " + oldKey + " already used; new key " + x.nextPk.toPlainString() + " (no sequence found, max+1)";
+                        x.used.add(Canon.key(vals, x.pkCols));
+                    }
+                    default -> {
+                        x.issues.add(new Issue(Level.BLOCKER, x.table, "Primary key collision for " + bdisplay + " from " + src
+                                + " cannot be re-keyed automatically (composite or non-numeric key without a sequence)."));
+                        x.rows.add(new PlannedRow(src, RowAction.UNRESOLVED_CONFLICT, oldKey, bdisplay, vals, null, List.of(), "key collision"));
+                        return;
+                    }
+                }
+            } else if (!x.pkCols.isEmpty()) {
+                x.used.add(Canon.key(row, x.pkCols));
+            }
+            List<Object> masterPk = pk.isEmpty() ? null : new ArrayList<>(pk.values());
+            collectViolations(x.def, vals, x.table, x.violations, x.violationExample, src + " " + bdisplay);
+            x.rows.add(new PlannedRow(src, action, oldKey, bdisplay, vals, masterPk, List.of(), note));
+        if (action == RowAction.INSERT) x.keptSourceKey = true;
+            x.record(src, x.table, oldKey, pk);
+            Map<String, Object> cmpWithPk = new LinkedHashMap<>(cmp);
+            cmpWithPk.putAll(pk);
+            x.vmPut.accept(bkey, new VRow(cmpWithPk, pk, x.rows.size() - 1));
+            return;
+        }
+
+        // ---- existing row (master or inserted earlier in this run)
+        List<String> differing = new ArrayList<>();
+        for (String c : cols) {
+            if (x.pkCols.contains(c) || x.newCols.contains(c)) continue;
+            if (!Canon.sameValue(cmp.get(c), ex.values.get(c))) differing.add(c);
+        }
+        if (differing.isEmpty()) {
+            x.record(src, x.table, oldKey, ex.pk);
+            x.rows.add(new PlannedRow(src, RowAction.SKIP_DUPLICATE, oldKey, bdisplay, Map.of(), listOf(ex.pk), List.of(), "identical to existing row"));
+            return;
+        }
+        Rules.RowDecision rd = x.rules.rowDecision(x.table, bdisplay);
+        Rules.TableRule tr = x.rules.tableRule(x.table);
+        ConflictAction action = rd != null ? rd.getAction() : tr != null ? tr.getAction() : null;
+        if (action == null) {
+            x.rows.add(new PlannedRow(src, RowAction.UNRESOLVED_CONFLICT, oldKey, bdisplay, subset(vals, differing), listOf(ex.pk), differing,
+                    "differs from existing row in " + differing + "; choose keep master / take source / newest / manual"));
+            x.record(src, x.table, oldKey, ex.pk);
+            return;
+        }
+        Map<String, Object> change = new LinkedHashMap<>();
+        String why = null;
+        if (action == ConflictAction.NEWEST) {
+            String dc = tr == null ? null : tr.getDateColumn();
+            if (dc == null || !cols.contains(dc)) {
+                x.rows.add(new PlannedRow(src, RowAction.UNRESOLVED_CONFLICT, oldKey, bdisplay, subset(vals, differing), listOf(ex.pk), differing,
+                        "'newest' needs a date column that exists in the table"));
+                x.record(src, x.table, oldKey, ex.pk);
+                return;
+            }
+            action = newer(cmp.get(dc), ex.values.get(dc)) ? ConflictAction.TAKE_SOURCE : ConflictAction.KEEP_MASTER;
+            why = "newest by " + dc + ": " + (action == ConflictAction.TAKE_SOURCE ? src : "existing row") + " wins";
+        }
+        switch (action) {
+            case KEEP_MASTER -> {
+                x.rows.add(new PlannedRow(src, RowAction.SKIP_KEEP_MASTER, oldKey, bdisplay, Map.of(), listOf(ex.pk), differing,
+                        why != null ? why : "conflict resolved: keep master"));
+                x.record(src, x.table, oldKey, ex.pk);
+                return;
+            }
+            case TAKE_SOURCE -> { for (String c : differing) change.put(c, vals.get(c)); }
+            case MANUAL -> {
+                if (rd == null || rd.getManualValues().isEmpty()) {
+                    x.rows.add(new PlannedRow(src, RowAction.UNRESOLVED_CONFLICT, oldKey, bdisplay, subset(vals, differing), listOf(ex.pk), differing,
+                            "manual decision without values"));
+                    x.record(src, x.table, oldKey, ex.pk);
+                    return;
+                }
+                for (var m : rd.getManualValues().entrySet()) {
+                    ColumnDef cd = x.def.columns().get(m.getKey());
+                    if (cd == null) throw new IllegalArgumentException("Manual value for unknown column " + m.getKey() + " in " + x.table);
+                    change.put(m.getKey(), Canon.convert(m.getValue(), cd));
+                }
+            }
+            default -> throw new IllegalStateException("unreachable");
+        }
+        x.record(src, x.table, oldKey, ex.pk);
+        if (ex.stepRowIndex < 0 && x.pkCols.isEmpty()) {
+            x.rows.add(new PlannedRow(src, RowAction.UNRESOLVED_CONFLICT, oldKey, bdisplay, subset(vals, differing), null, differing,
+                    "table has no primary key, so an existing row cannot be updated; choose keep master"));
+            return;
+        }
+        if (ex.stepRowIndex >= 0) {
+            // The target row is being inserted by this run: patch that planned insert instead of updating.
+            PlannedRow planned = x.rows.get(ex.stepRowIndex);
+            Map<String, Object> patched = new LinkedHashMap<>(planned.values());
+            patched.putAll(change);
+            x.rows.set(ex.stepRowIndex, new PlannedRow(planned.sourceDb(), planned.action(), planned.oldKey(), planned.businessKey(),
+                    patched, planned.masterPk(), planned.changedColumns(), (planned.note() == null ? "" : planned.note() + "; ")
+                    + "values from " + src + " applied (" + (why != null ? why : "conflict rule") + ")"));
+            x.rows.add(new PlannedRow(src, RowAction.SKIP_DUPLICATE, oldKey, bdisplay, Map.of(), listOf(ex.pk), differing,
+                    "merged into row inserted from " + planned.sourceDb()));
+        } else {
+            collectViolations(x.def, change, x.table, x.violations, x.violationExample, src + " " + bdisplay);
+            x.rows.add(new PlannedRow(src, RowAction.UPDATE, oldKey, bdisplay, change, listOf(ex.pk), new ArrayList<>(change.keySet()),
+                    why != null ? why : "conflict resolved by rule"));
+        }
+        for (var c : change.entrySet()) ex.values.put(c.getKey(), c.getValue() instanceof FkRef ? "\u0000SYMBOLIC" : c.getValue());
+
+    }
+
+    /** Keys in use for a table's primary key: the master's plus those this plan inserts. */
+    interface KeyUse {
+        boolean contains(String key);
+        void add(String key);
+    }
+
+    private static KeyUse keysOf(KeySet set) {
+        return new KeyUse() {
+            @Override public boolean contains(String key) { return set.contains(key); }
+            @Override public void add(String key) { set.add(key); }
+        };
+    }
+
+    /** Where planned rows go: a list in memory, or a group buffer in front of a plan file. Indices are absolute. */
+    interface Sink {
+        void add(PlannedRow r);
+        PlannedRow get(int index);
+        void set(int index, PlannedRow r);
+        int size();
+    }
+
+    private record ListSink(List<PlannedRow> rows) implements Sink {
+        @Override public void add(PlannedRow r) { rows.add(r); }
+        @Override public PlannedRow get(int i) { return rows.get(i); }
+        @Override public void set(int i, PlannedRow r) { rows.set(i, r); }
+        @Override public int size() { return rows.size(); }
+    }
+
+    /** One table's planning state, shared by the in-memory and the streaming path. */
+    private static final class Ctx {
+        final String table;
+        final TableDef def;
+        final List<String> key, pkCols;
+        final Set<String> newCols;
+        final PkMode pkMode;
+        final String sequence;
+        final Rules rules;
+        final Options options;
+        final KeyMap idMap;
+        final Map<String, KeySet> pkSets;
+        final List<Issue> issues;
+        final Map<String, Integer> violations = new LinkedHashMap<>();
+        final Map<String, String> violationExample = new LinkedHashMap<>();
+        final List<String> orphanExamples = new ArrayList<>();
+        int orphanCount;
+        boolean keptSourceKey;
+        KeyUse used;
+        BigDecimal nextPk;
+        List<FkInfo> fks;
+        Sink rows;
+        java.util.function.Function<String, VRow> vmGet;
+        java.util.function.BiConsumer<String, VRow> vmPut;
+        java.util.function.Predicate<String> sourcePkSet = k -> false;
+        /** Whether another merged table points at this one: only then are source keys recorded for rewriting children. */
+        boolean referenced = true;
+
+        void record(String src, String table, String oldKey, Map<String, Object> pk) {
+            if (referenced) idMap.put(src, table, oldKey, pk);
+        }
+
+        Ctx(String table, TableDef def, List<String> key, List<String> pkCols, Set<String> newCols, PkMode pkMode, String sequence,
+            Rules rules, Options options, KeyMap idMap, Map<String, KeySet> pkSets, List<Issue> issues) {
+            this.table = table;
+            this.def = def;
+            this.key = key;
+            this.pkCols = pkCols;
+            this.newCols = newCols;
+            this.pkMode = pkMode;
+            this.sequence = sequence;
+            this.rules = rules;
+            this.options = options;
+            this.idMap = idMap;
+            this.pkSets = pkSets;
+            this.issues = issues;
+        }
+    }
+
+    /** Tables that a declared foreign key of another merged table (or of themselves) points at. */
+    static Set<String> referencedTables(Map<String, TableDef> tables) {
+        Set<String> out = new HashSet<>();
+        for (TableDef t : tables.values()) {
+            for (ConstraintDef c : t.constraints()) if (c.type().equals("R") && c.refTable() != null) out.add(c.refTable());
+        }
+        return out;
     }
 
     // ---------------------------------------------------------------- helpers
@@ -437,12 +810,6 @@ public class MergePlanner {
             out.add(new FkInfo(c.refTable(), c.columns(), c.refColumns(), ppk, pkRef));
         }
         return out;
-    }
-
-    private static boolean tablesWithSourceRowsFrom(Map<String, Map<String, Object>> idMap, String src, String parent) {
-        String prefix = src + "|" + parent + "|";
-        for (String k : idMap.keySet()) if (k.startsWith(prefix)) return true;
-        return false;
     }
 
     private static List<Map<String, Object>> orderBySelfReference(List<Map<String, Object>> rows, List<ConstraintDef> selfFks,
@@ -561,10 +928,18 @@ public class MergePlanner {
         return m;
     }
 
+    /** SHA-256 over the plan, fed line by line so a plan with millions of rows never becomes one string. */
     static String fingerprint(String master, List<String> sources, Options options, List<TableStep> steps, List<AlterStatement> alters) {
+        MessageDigest md;
+        try {
+            md = MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
         StringBuilder sb = new StringBuilder();
         sb.append(master).append('|').append(sources).append('|').append(options).append('\n');
         for (AlterStatement a : alters) sb.append(a.id()).append('|').append(a.sql()).append('\n');
+        feed(md, sb);
         for (TableStep s : steps) {
             sb.append(s.table()).append('|').append(s.pkMode()).append('|').append(s.sequence()).append('|').append(s.masterRowsAtPlan()).append('\n');
             for (PlannedRow r : s.rows()) {
@@ -573,13 +948,15 @@ public class MergePlanner {
                     sb.append(e.getKey()).append('=').append(e.getValue() instanceof FkRef f ? f.toString() : Canon.of(e.getValue())).append(';');
                 }
                 sb.append('\n');
+                if (sb.length() > 64 * 1024) feed(md, sb);
             }
         }
-        try {
-            byte[] d = MessageDigest.getInstance("SHA-256").digest(sb.toString().getBytes(StandardCharsets.UTF_8));
-            return HexFormat.of().formatHex(d, 0, 12);
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException(e);
-        }
+        feed(md, sb);
+        return HexFormat.of().formatHex(md.digest(), 0, 12);
+    }
+
+    private static void feed(MessageDigest md, StringBuilder sb) {
+        md.update(sb.toString().getBytes(StandardCharsets.UTF_8));
+        sb.setLength(0);
     }
 }
