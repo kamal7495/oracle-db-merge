@@ -109,7 +109,7 @@ public class MergeExecutor {
                     Map<String, Long> tc = new LinkedHashMap<>();
                     counts.put(step.table(), tc);
                     for (PlannedRow r : step.rows()) {
-                        Map<String, Object> pk = apply(c, schema, step, r, keyMap, byBusiness, inserted);
+                        Map<String, Object> pk = apply(c, schema, plan.effectiveTables().get(step.table()), step, r, keyMap, byBusiness, inserted);
                         if (pk != null) {
                             keyMap.put(r.sourceDb() + "|" + step.table() + "|" + r.oldKey(), pk);
                             byBusiness.putIfAbsent(step.table() + "|" + r.businessKey(), pk);
@@ -164,7 +164,7 @@ public class MergeExecutor {
     // ------------------------------------------------------------------ rows
 
     /** Applies one planned row; returns the master primary key the row now corresponds to (null if unknown). */
-    private Map<String, Object> apply(Connection c, String schema, TableStep step, PlannedRow r, Map<String, Map<String, Object>> keyMap,
+    private Map<String, Object> apply(Connection c, String schema, TableDef def, TableStep step, PlannedRow r, Map<String, Map<String, Object>> keyMap,
                                       Map<String, Map<String, Object>> byBusiness, List<Inserted> inserted) throws SQLException {
         switch (r.action()) {
             case INSERT, INSERT_REMAPPED -> {
@@ -173,11 +173,13 @@ public class MergeExecutor {
                 String pkCol = step.pkColumns().size() == 1 ? step.pkColumns().get(0) : null;
                 if (seq) vals.put(pkCol, nextVal(c, schema, step.sequence()));
                 List<String> cols = new ArrayList<>(vals.keySet());
+                List<String> placeholders = new ArrayList<>();
+                for (String col : cols) placeholders.add(placeholder(def, col, vals.get(col)));
                 String sql = "INSERT INTO " + qualified(schema, step.table()) + " (" + columnList(cols) + ") VALUES ("
-                        + "?,".repeat(cols.size() - 1) + "?)";
+                        + String.join(",", placeholders) + ")";
                 Map<String, Object> pk = new LinkedHashMap<>();
                 try (PreparedStatement ps = pkCol != null ? c.prepareStatement(sql, new String[] {pkCol}) : c.prepareStatement(sql)) {
-                    bind(ps, cols, vals);
+                    bind(ps, def, cols, vals);
                     ps.executeUpdate();
                     if (pkCol != null) {
                         try (ResultSet gk = ps.getGeneratedKeys()) {
@@ -193,11 +195,13 @@ public class MergeExecutor {
                 Map<String, Object> vals = resolve(r.values(), keyMap);
                 List<String> cols = new ArrayList<>(vals.keySet());
                 StringBuilder sql = new StringBuilder("UPDATE " + qualified(schema, step.table()) + " SET ");
-                for (int i = 0; i < cols.size(); i++) sql.append(i > 0 ? ", " : "").append(quote(cols.get(i))).append(" = ?");
+                for (int i = 0; i < cols.size(); i++) {
+                    sql.append(i > 0 ? ", " : "").append(quote(cols.get(i))).append(" = ").append(placeholder(def, cols.get(i), vals.get(cols.get(i))));
+                }
                 sql.append(" WHERE ");
                 for (int i = 0; i < step.pkColumns().size(); i++) sql.append(i > 0 ? " AND " : "").append(quote(step.pkColumns().get(i))).append(" = ?");
                 try (PreparedStatement ps = c.prepareStatement(sql.toString())) {
-                    int n = bind(ps, cols, vals);
+                    int n = bind(ps, def, cols, vals);
                     for (int i = 0; i < step.pkColumns().size(); i++) ps.setObject(n + i, r.masterPk().get(i));
                     int updated = ps.executeUpdate();
                     if (updated != 1) throw new SQLException("UPDATE of " + step.table() + " " + r.businessKey() + " changed " + updated + " rows, expected 1");
@@ -235,10 +239,18 @@ public class MergeExecutor {
         return out;
     }
 
-    private static int bind(PreparedStatement ps, List<String> cols, Map<String, Object> vals) throws SQLException {
+    /** "?" for a bound value, or EMPTY_CLOB()/EMPTY_BLOB() for an empty LOB, which a bind would turn into NULL. */
+    private static String placeholder(TableDef def, String col, Object v) {
+        String empty = EmptyLobs.expression(def, col, v);
+        return empty != null ? empty : "?";
+    }
+
+    /** Binds every value that got a "?" from {@link #placeholder}; returns the next parameter index. */
+    private static int bind(PreparedStatement ps, TableDef def, List<String> cols, Map<String, Object> vals) throws SQLException {
         int i = 1;
         for (String col : cols) {
             Object v = vals.get(col);
+            if (EmptyLobs.expression(def, col, v) != null) continue;
             if (v == null) ps.setNull(i++, Types.NULL);
             else ps.setObject(i++, v);
         }

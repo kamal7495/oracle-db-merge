@@ -7,9 +7,9 @@ Compare and merge **N Oracle databases into one master**. Java 17, Maven, `ojdbc
 * **Phase 3** – merge the others into the master you choose: dependency-ordered, collision-safe, dry-run by default, one transaction, validated before commit.
 
 > **Status of this build – read this first.**
-> The pure logic (comparator, row matcher, FK graph, merge planner, SQL script renderer, ALTER generator) is covered by unit tests that were run.
-> The code that needs Spring, Apache POI, the Oracle driver, a real Oracle database or Docker (`ConnectionRegistry`, `SchemaExtractor`, `RowLoader`, `MergeExecutor`, `JdbcMergeData`, the controllers, the Excel writers and the `*IT` integration tests) was written but **has not been executed**: the build sandbox could not reach Maven Central and had no Docker daemon.
-> Run `mvn verify` yourself and expect to fix small things. **Do not point the executor at a real master before running the integration tests and a dry run on a copy.**
+> `mvn verify` passes: the unit tests plus the Testcontainers integration tests against Oracle Free 23 (`SchemaExtractorIT`, `MergeIT`, `LobMergeIT`). These cover extraction, the Phase 2 comparison, planning, executing, rolling back and validating merges, including BLOB/CLOB columns.
+> **Not covered by any test:** the REST controllers, the web UI and the Excel report writers. The server starts and serves the UI, but these have not been exercised end to end.
+> **Do not point the executor at a real master before a dry run on a copy and a Data Pump backup.**
 
 ## Requirements
 
@@ -94,19 +94,33 @@ Constraints and indexes are matched by structure (columns, type, referenced tabl
 
 * **Oracle commits DDL immediately.** Approved ALTER/CREATE statements cannot be rolled back with the data transaction. If the data step later rolls back, the schema changes stay (the log says so).
 * No sequences or triggers are created or advanced. After loading rows with their own keys, advance the master's sequences beyond `MAX(pk)` (the plan warns).
-* Check constraints and other DB rules are not pre-validated; the database enforces them and a violation rolls the run back (the `MergeIT` rollback test uses this).
+* Only NOT NULL, text length and type conversion are checked while planning. **UNIQUE constraints other than the business key, CHECK constraints** and other DB rules are not pre-validated: the database enforces them during the run and a violation rolls the whole data transaction back (the `MergeIT` rollback test uses this). Example: the business key is the PK and a source row brings a new ID with an e-mail the master already has.
+* Planning straight after a schema change (e.g. a run whose approved `CREATE TABLE` committed but whose data step rolled back) can hit `ORA-01466` because reads use `READ ONLY` transactions. Reads retry automatically for about 10 seconds.
 * Business-key columns should be natural columns (e-mail, SKU), **not foreign-key columns**: keys are compared on source values before FK rewriting.
 * Everything is processed in memory (`max-rows-per-table`). Large tables need a different approach (staging tables / Data Pump / `MERGE`).
-* FK cycles between tables are blocked rather than solved. LOB columns, XMLType, object types are not specially handled.
-* The generated `.sql` is a review copy: `COMMIT` is commented out and it ends in `ROLLBACK`. Very long string literals (> 4000 bytes) would need manual handling there. The app itself uses bind variables.
-* Excel writing, Spring wiring, JDBC code and the Oracle ITs were not run in the build environment (see top).
+* FK cycles between tables are blocked rather than solved.
+* **LOBs.** BLOB, CLOB and NCLOB are read whole, compared byte for byte / character for character, and written through bind variables. `LobMergeIT` covers 1–2 MB BLOBs, a 100 000-character Unicode CLOB, NULLs, empty LOBs (`EMPTY_BLOB()`/`EMPTY_CLOB()` stay empty, not NULL) and FK rewriting on tables with LOBs. Limits:
+  * Each LOB is held in memory, plus a hex copy of each BLOB (about twice its size) for comparison. `max-rows-per-table` caps rows, not bytes, so tables of large documents or images can exhaust the heap. They need a streaming/hash-based approach.
+  * Phase 2 reports show BLOBs as hex text.
+  * BFILE, `LONG`, XMLType and object types are not handled.
+* The generated `.sql` is a review copy: `COMMIT` is commented out and it ends in `ROLLBACK`. Values are written as literals, so CLOBs over 4 000 characters and BLOBs over 2 000 bytes produce `ORA-01704` there unless the database uses `MAX_STRING_SIZE=EXTENDED`. The app itself uses bind variables and is not affected.
 
 ## Tests
 
 ```bash
 mvn test      # unit tests (no database): comparator, registry, row matcher, FK graph, planner, script/alter generators, report writers
-mvn verify    # also the Testcontainers integration tests (needs Docker): SchemaExtractorIT, MergeIT
+mvn verify    # also the Testcontainers integration tests (needs Docker): SchemaExtractorIT, MergeIT, LobMergeIT
 ```
+
+The integration tests are skipped, not failed, when Testcontainers finds no Docker, so check the output says `Skipped: 0`. With Colima instead of Docker Desktop:
+
+```bash
+export DOCKER_HOST=unix://$HOME/.colima/default/docker.sock
+export TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock
+mvn verify
+```
+
+`LobMergeIT` builds its own `DOC`/`DOC_NOTE` tables (CLOB + BLOB) in code instead of using the sample scripts.
 
 Sample schemas live in `src/test/resources/sample/schema_a.sql` (master) and `schema_b.sql` (source): FK chain `REGION ← CUSTOMER ← ORDERS ← ORDER_ITEM → PRODUCT`, PK collisions (customer 1 is Alice in A, Carol in B), identical duplicates (Bob, Widget), same person with different PK (Alice 1 vs 3), a table only in B (`AUDIT_NOTE`), a wider `EMAIL`, a different `QTY` type, an extra column, a missing index/trigger, and an order status that violates A's check constraint (used to prove rollback).
 

@@ -92,7 +92,7 @@ public final class ScriptRenderer {
                 boolean seq = r.action() == RowAction.INSERT_REMAPPED && step.pkMode() == PkMode.SEQUENCE;
                 for (String c : cols) {
                     if (seq && c.equals(step.pkColumns().get(0))) vals.add(quote(step.sequence()) + ".NEXTVAL");
-                    else vals.add(value(plan, r.values().get(c)));
+                    else vals.add(value(plan, step, c, r.values().get(c)));
                 }
                 sb.append("-- ").append(r.sourceDb()).append(' ').append(r.businessKey()).append(r.note() == null ? "" : " - " + r.note()).append('\n');
                 sb.append("INSERT INTO ").append(t).append(" (").append(columnList(cols)).append(") VALUES (").append(String.join(", ", vals)).append(");\n");
@@ -102,7 +102,7 @@ public final class ScriptRenderer {
             }
             case UPDATE -> {
                 List<String> sets = new ArrayList<>();
-                for (var e : r.values().entrySet()) sets.add(quote(e.getKey()) + " = " + value(plan, e.getValue()));
+                for (var e : r.values().entrySet()) sets.add(quote(e.getKey()) + " = " + value(plan, step, e.getKey(), e.getValue()));
                 sb.append("-- ").append(r.sourceDb()).append(' ').append(r.businessKey()).append(" - ").append(r.note()).append('\n');
                 sb.append("UPDATE ").append(t).append(" SET ").append(String.join(", ", sets)).append(" WHERE ").append(where(step, r)).append(";\n");
                 sb.append(audit(plan, step, r, r.masterPk() == null ? "NULL" : toVal(r.masterPk().get(0))));
@@ -129,7 +129,9 @@ public final class ScriptRenderer {
         return canonicalKey.replace('\u0001', '|');
     }
 
-    private static String value(MergePlan plan, Object v) {
+    private static String value(MergePlan plan, TableStep step, String column, Object v) {
+        String empty = EmptyLobs.expression(plan.effectiveTables().get(step.table()), column, v);
+        if (empty != null) return empty;    // '' / HEXTORAW('') would be NULL in Oracle
         if (v instanceof FkRef f) {
             return "(SELECT TO_NUMBER(NEW_PK) FROM " + quote(AlterScriptGenerator.AUDIT_TABLE) + " WHERE RUN_ID = " + literal(plan.id())
                     + " AND SOURCE_DB = " + literal(f.sourceDb()) + " AND TABLE_NAME = " + literal(f.parentTable())
