@@ -255,7 +255,7 @@ public final class Cli {
         }
         lines.add("  " + result.differences().size() + " difference(s): " + counts);
         result.differences().stream().limit(MAX_LINES).forEach(d ->
-                lines.add("    " + d.severity() + "  " + d.kind().label() + "  " + d.table() + (d.object() == null ? "" : "." + d.object())));
+                lines.add("    " + d.severity() + "  " + d.kind().label() + "  " + (d.object() != null ? d.object() : d.table())));
         if (result.differences().size() > MAX_LINES) lines.add("    ... see the report for the rest");
         lines.add("  fail-on " + threshold + " -> " + (code == ExitCodes.OK ? "pass" : "FAIL"));
         lines.add("  report: " + html);
@@ -305,7 +305,7 @@ public final class Cli {
             boolean differs = ExitCodes.differs(t);
             boolean uncompared = ExitCodes.uncompared(t);
             if ((differs || uncompared) && shown++ < MAX_LINES) {
-                lines.add("    " + t.table() + "  " + t.status() + "  rows " + t.rowCounts() + "  only-in-one " + t.onlyInTotal()
+                lines.add("    " + t.table() + "  " + t.status() + "  rows " + rowText(t.rowCounts()) + "  only-in-one " + t.onlyInTotal()
                         + "  conflicts " + t.conflictCount() + "  pk-collisions " + t.pkCollisionCount()
                         + (t.message() == null ? "" : "  (" + t.message() + ")"));
             }
@@ -422,6 +422,11 @@ public final class Cli {
         lines.add("  issues: " + byLevel + (p.alters().isEmpty() ? "" : ", " + p.alters().size() + " schema change(s) proposed"));
         p.issues().stream().filter(i -> i.level() == Level.BLOCKER).limit(MAX_LINES)
                 .forEach(i -> lines.add("    BLOCKER  " + (i.table() == null ? "" : i.table() + ": ") + i.message()));
+        long unresolved = p.steps().stream().mapToLong(st -> st.count(RowAction.UNRESOLVED_CONFLICT)).sum();
+        if (unresolved > 0) {
+            lines.add("    BLOCKER  " + unresolved + " conflicting row(s) need a decision (keep master, take source, newest or manual):"
+                    + " save rules in the UI or pass --rules FILE");
+        }
         lines.add("  " + (code == ExitCodes.OK ? "pass" : "FAIL") + (p.hasBlockers() ? " (blockers)" : ""));
         lines.add("  report: " + html);
         lines.add("  script: " + sql + " (review copy; ends in ROLLBACK)");
@@ -458,5 +463,15 @@ public final class Cli {
         } else {
             r.lines().forEach(out::println);
         }
+    }
+
+    /** Row counts for the summary line; a table missing from a database (count -1) shows as "missing". */
+    static String rowText(Map<String, ? extends Number> counts) {
+        StringBuilder b = new StringBuilder("{");
+        counts.forEach((db, n) -> {
+            if (b.length() > 1) b.append(", ");
+            b.append(db).append('=').append(n == null || n.longValue() < 0 ? "missing" : n.toString());
+        });
+        return b.append('}').toString();
     }
 }
