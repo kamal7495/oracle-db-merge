@@ -8,8 +8,8 @@ Compare and merge **N Oracle databases into one master**. Java 17, Maven, `ojdbc
 * **Undeclared references** – for one schema, list the columns that act like foreign keys but have no FOREIGN KEY constraint, optionally checked against the data. Run this before merging a schema whose integrity lives in the application (typical of vendor packages such as trading systems).
 
 > **Status of this build – read this first.**
-> `mvn verify` passes: the unit tests plus the Testcontainers integration tests against Oracle Free 23 (`SchemaExtractorIT`, `MergeIT`, `LobMergeIT`, `ReferenceIT`, `DataHashCompareIT`). These cover extraction, the Phase 2 comparison (in memory and by server-side hash), planning, executing, rolling back and validating merges (including BLOB/CLOB columns), and the undeclared-reference detection with its data check.
-> **Not covered by any test:** the REST controllers, the web UI and the Excel report writers. The server starts and serves the UI, but these have not been exercised end to end.
+> `mvn verify` passes: the unit tests plus the Testcontainers integration tests against Oracle Free 23 (`SchemaExtractorIT`, `MergeIT`, `LobMergeIT`, `ReferenceIT`, `DataHashCompareIT`, `WebFlowIT`). These cover extraction, the Phase 2 comparison (in memory and by server-side hash), planning, executing, rolling back and validating merges (including BLOB/CLOB columns), the undeclared-reference detection with its data check, every REST endpoint (`WebApiTest`, no database), and the UI itself: `WebFlowIT` drives a complete merge through the page in headless Chromium.
+> **Lightly covered:** the content of the Phase 2 Excel report and the merge reports (generated and downloaded in tests, not checked cell by cell).
 > **Do not point the executor at a real master before a dry run on a copy and a Data Pump backup.**
 
 ## Requirements
@@ -278,9 +278,22 @@ Limits: detection works from names, so it misses references whose names do not m
 ## Tests
 
 ```bash
-mvn test      # unit tests (no database): comparator, registry, row matcher, FK graph, planner, script/alter generators, report writers, reference detector
-mvn verify    # also the Testcontainers integration tests (needs Docker): SchemaExtractorIT, MergeIT, LobMergeIT, ReferenceIT, DataHashCompareIT
+mvn test      # unit tests (no database): comparator, registry, row matcher, FK graph, planner, script/alter generators, report writers, reference detector, REST API
+mvn verify    # also the Testcontainers integration tests (needs Docker): SchemaExtractorIT, MergeIT, LobMergeIT, ReferenceIT, DataHashCompareIT, WebFlowIT
 ```
+
+* `WebApiTest` (unit, no database) calls every REST endpoint as the UI does, with schema extraction replaced by fixed
+  models: connections (never echoing the password, saved ones encrypted), Phase 1 with filters and snapshots, report
+  downloads (and path tricks refused), the refusals for data/merge on snapshot comparisons, conflict rules, the
+  reference report, error replies (one-line database errors, 404/405/400 instead of stack traces) and that every
+  control the page's script looks up exists in the page. Saved connections, reports and rules go to a temporary folder.
+* `WebFlowIT` starts the application on a random port against Oracle with the sample schemas. One test walks the
+  REST flow, including every way execution must refuse (no backup confirmed, phrase not exact, blockers, snapshot as
+  source). The other drives the page in headless Chromium with [Playwright](https://playwright.dev/java/): it adds the
+  connections in the form, compares with a filter, runs the reference report and the data comparison with business
+  keys ticked in the key table, decides conflicts with *Remember for table*, approves the schema changes, ticks the
+  backup box, types the confirmation phrase and executes, then checks the master in the database and that the browser
+  logged no errors. Playwright downloads Chromium on first use (about 150 MB, into its own cache).
 
 The integration tests are skipped, not failed, when Testcontainers finds no Docker, so check the output says `Skipped: 0`. With Colima instead of Docker Desktop:
 

@@ -119,7 +119,12 @@ public class ApiController {
         for (SnapshotUpload u : uploads) {
             if (u == null || u.content() == null) throw new IllegalArgumentException("Empty snapshot upload.");
             String name = SchemaSnapshot.nicknameFor(u.name() == null ? "snapshot" : u.name());
-            SchemaModel m = SchemaSnapshot.fromJson(u.content(), name);
+            SchemaModel m;
+            try {
+                m = SchemaSnapshot.fromJson(u.content(), name);
+            } catch (IOException e) {
+                throw new IllegalArgumentException("Snapshot '" + u.name() + "': " + e.getMessage());
+            }
             if (nicks.contains(name) || !snapshotNames.add(name)) {
                 throw new IllegalArgumentException("Snapshot '" + u.name() + "' would be named " + name
                         + ", like another database in this comparison: rename the file.");

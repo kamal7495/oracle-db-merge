@@ -26,6 +26,22 @@ public class ApiExceptionHandler {
         return ResponseEntity.status(HttpStatus.BAD_GATEWAY).body(Map.of("error", first));
     }
 
+    /** Unknown URL, wrong method, wrong content type...: Spring already knows the right status; no stack trace. */
+    @ExceptionHandler(jakarta.servlet.ServletException.class)
+    ResponseEntity<Map<String, String>> framework(jakarta.servlet.ServletException e) {
+        if (e instanceof org.springframework.web.ErrorResponse r) {
+            String reason = r.getBody().getTitle() == null ? "Request failed" : r.getBody().getTitle();
+            return ResponseEntity.status(r.getStatusCode()).body(Map.of("error", reason));
+        }
+        return unexpected(e);
+    }
+
+    /** Malformed JSON, or a value of the wrong type (e.g. an unknown conflict action). The detail is not echoed. */
+    @ExceptionHandler(org.springframework.http.converter.HttpMessageNotReadableException.class)
+    ResponseEntity<Map<String, String>> unreadable(org.springframework.http.converter.HttpMessageNotReadableException e) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of("error", "The request body is not valid JSON for this call."));
+    }
+
     @ExceptionHandler(Exception.class)
     ResponseEntity<Map<String, String>> unexpected(Exception e) {
         log.error("Unexpected error", e);
