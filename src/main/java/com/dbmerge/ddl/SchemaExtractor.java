@@ -1,11 +1,15 @@
 package com.dbmerge.ddl;
 
 import com.dbmerge.conn.ConnectionSource;
+import com.dbmerge.ddl.model.CodeObjectDef;
 import com.dbmerge.ddl.model.ColumnDef;
 import com.dbmerge.ddl.model.ConstraintDef;
+import com.dbmerge.ddl.model.GrantDef;
 import com.dbmerge.ddl.model.IndexDef;
 import com.dbmerge.ddl.model.SchemaModel;
 import com.dbmerge.ddl.model.SequenceDef;
+import com.dbmerge.ddl.model.SourceNormalizer;
+import com.dbmerge.ddl.model.SynonymDef;
 import com.dbmerge.ddl.model.TableDef;
 import com.dbmerge.ddl.model.TriggerDef;
 import java.sql.CallableStatement;
@@ -26,7 +30,8 @@ import java.util.regex.Pattern;
 
 /**
  * Reads tables, columns, PK/FK/unique/check constraints, indexes, sequences and triggers for one schema from the
- * ALL_* dictionary views, plus DBMS_METADATA DDL text for display. Everything runs in a READ ONLY transaction.
+ * ALL_* dictionary views, plus DBMS_METADATA DDL text for display. Also reads views, materialized views and
+ * stored PL/SQL (normalised source and VALID/INVALID status), private synonyms and object grants. Everything runs in a READ ONLY transaction.
  * Requires Oracle 12.2+ (ALL_CONSTRAINTS.SEARCH_CONDITION_VC).
  */
 public class SchemaExtractor {
@@ -60,7 +65,11 @@ public class SchemaExtractor {
             }
             Map<String, String> ddl = new LinkedHashMap<>();
             if (includeDdl) loadDdl(c, owner, tables, sequences, ddl, warnings);
-            return new SchemaModel(nickname, owner, tables, new TreeMap<>(sequences), ddl, warnings, Instant.now());
+            Map<String, CodeObjectDef> code = loadCodeObjects(c, owner);
+            Map<String, SynonymDef> synonyms = loadSynonyms(c, owner);
+            Map<String, GrantDef> grants = loadGrants(c, owner);
+            return new SchemaModel(nickname, owner, tables, new TreeMap<>(sequences), ddl, warnings, Instant.now(),
+                    code, synonyms, grants);
         }
     }
 
@@ -297,6 +306,129 @@ public class SchemaExtractor {
                 while (rs.next()) {
                     out.put(rs.getString(1), new SequenceDef(rs.getString(1), rs.getString(2), rs.getString(3),
                             rs.getString(4), "Y".equals(rs.getString(5)), "Y".equals(rs.getString(6)), rs.getLong(7)));
+                }
+            }
+        }
+        return out;
+    }
+
+    // ------------------------------------------- views, materialized views, PL/SQL
+
+    /** Source-bearing object types read from ALL_SOURCE. Triggers are compared with their table instead. */
+    static final List<String> SOURCE_TYPES = List.of("PACKAGE", "PACKAGE BODY", "PROCEDURE", "FUNCTION", "TYPE", "TYPE BODY");
+
+    private Map<String, CodeObjectDef> loadCodeObjects(Connection c, String owner) throws SQLException {
+        // Status of every user-created (not system-generated) object; only these are compared.
+        Map<String, String> status = new LinkedHashMap<>();
+        String objSql = "SELECT object_type, object_name, status FROM all_objects WHERE owner = ? AND generated = 'N' "
+                + "AND object_name NOT LIKE 'BIN$%' AND object_type IN ('VIEW','MATERIALIZED VIEW',"
+                + String.join(",", SOURCE_TYPES.stream().map(t -> "'" + t + "'").toList()) + ")";
+        try (PreparedStatement ps = c.prepareStatement(objSql)) {
+            ps.setString(1, owner);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) status.put(rs.getString(1) + ":" + rs.getString(2), rs.getString(3));
+            }
+        }
+        Map<String, CodeObjectDef> out = new TreeMap<>();
+
+        // ALL_VIEWS.TEXT is a LONG column: read last, in select order.
+        try (PreparedStatement ps = c.prepareStatement("SELECT view_name, text FROM all_views WHERE owner = ?")) {
+            ps.setString(1, owner);
+            ps.setFetchSize(200);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String name = rs.getString(1);
+                    String text = rs.getString(2);
+                    put(out, status, new CodeObjectDef("VIEW", name, status.get("VIEW:" + name), "",
+                            SourceNormalizer.normalize(text, owner)));
+                }
+            }
+        }
+
+        // ALL_MVIEWS.QUERY is a LONG column: read last.
+        String mvSql = "SELECT mview_name, refresh_method, refresh_mode, query FROM all_mviews WHERE owner = ?";
+        try (PreparedStatement ps = c.prepareStatement(mvSql)) {
+            ps.setString(1, owner);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String name = rs.getString(1);
+                    String options = "REFRESH " + rs.getString(2) + " ON " + rs.getString(3);
+                    String query = rs.getString(4);
+                    put(out, status, new CodeObjectDef("MATERIALIZED VIEW", name, status.get("MATERIALIZED VIEW:" + name),
+                            options, SourceNormalizer.normalize(query, owner)));
+                }
+            }
+        }
+
+        String srcSql = "SELECT type, name, text FROM all_source WHERE owner = ? AND type IN ("
+                + String.join(",", SOURCE_TYPES.stream().map(t -> "'" + t + "'").toList()) + ") ORDER BY type, name, line";
+        try (PreparedStatement ps = c.prepareStatement(srcSql)) {
+            ps.setString(1, owner);
+            ps.setFetchSize(2000);
+            try (ResultSet rs = ps.executeQuery()) {
+                String curType = null;
+                String curName = null;
+                StringBuilder text = new StringBuilder();
+                while (rs.next()) {
+                    String type = rs.getString(1);
+                    String name = rs.getString(2);
+                    if (!(type.equals(curType) && name.equals(curName))) {
+                        if (curType != null) putSource(out, status, owner, curType, curName, text);
+                        curType = type;
+                        curName = name;
+                        text.setLength(0);
+                    }
+                    String line = rs.getString(3);
+                    if (line != null) text.append(line);
+                    if (line == null || !line.endsWith("\n")) text.append('\n');
+                }
+                if (curType != null) putSource(out, status, owner, curType, curName, text);
+            }
+        }
+        return out;
+    }
+
+    private static void putSource(Map<String, CodeObjectDef> out, Map<String, String> status, String owner,
+                                  String type, String name, StringBuilder text) {
+        put(out, status, new CodeObjectDef(type, name, status.get(type + ":" + name), "",
+                SourceNormalizer.normalize(text.toString(), owner)));
+    }
+
+    /** Keeps only objects listed in ALL_OBJECTS as user-created (drops system-generated types and the recycle bin). */
+    private static void put(Map<String, CodeObjectDef> out, Map<String, String> status, CodeObjectDef o) {
+        if (status.containsKey(o.key())) out.put(o.key(), o);
+    }
+
+    // ------------------------------------------------------ synonyms, grants
+
+    private Map<String, SynonymDef> loadSynonyms(Connection c, String owner) throws SQLException {
+        String sql = "SELECT synonym_name, table_owner, table_name, db_link FROM all_synonyms WHERE owner = ? "
+                + "AND synonym_name NOT LIKE 'BIN$%'";
+        Map<String, SynonymDef> out = new TreeMap<>();
+        try (PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setString(1, owner);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String targetOwner = rs.getString(2);
+                    if (owner.equals(targetOwner)) targetOwner = SynonymDef.OWN_SCHEMA;
+                    out.put(rs.getString(1), new SynonymDef(rs.getString(1), targetOwner, rs.getString(3), rs.getString(4)));
+                }
+            }
+        }
+        return out;
+    }
+
+    private Map<String, GrantDef> loadGrants(Connection c, String owner) throws SQLException {
+        String sql = "SELECT DISTINCT table_name, grantee, privilege, grantable FROM all_tab_privs "
+                + "WHERE table_schema = ? AND grantee <> ? AND table_name NOT LIKE 'BIN$%'";
+        Map<String, GrantDef> out = new TreeMap<>();
+        try (PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setString(1, owner);
+            ps.setString(2, owner);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    GrantDef g = new GrantDef(rs.getString(1), rs.getString(2), rs.getString(3), "YES".equals(rs.getString(4)));
+                    out.merge(g.key(), g, (a, b) -> a.grantable() ? a : b); // granted twice (by two grantors): keep the stronger
                 }
             }
         }

@@ -53,7 +53,8 @@ public class ExcelReportWriter {
         put(s, row++, 0, "Oracle DDL comparison", st.bold);
         put(s, row++, 0, "Run " + r.id() + " at " + r.generatedAt(), st.plain);
         row++;
-        header(s, row++, st, "Database", "Schema", "Tables", "Columns", "Sequences", "Warnings");
+        header(s, row++, st, "Database", "Schema", "Tables", "Columns", "Sequences", "Warnings",
+                "Views", "PL/SQL units", "Synonyms", "Grants");
         for (SchemaModel m : r.models()) {
             Row x = s.createRow(row++);
             cell(x, 0, m.nickname(), st.plain);
@@ -62,6 +63,10 @@ public class ExcelReportWriter {
             num(x, 3, m.columnCount(), st.plain);
             num(x, 4, m.sequences().size(), st.plain);
             num(x, 5, m.warnings().size(), st.plain);
+            num(x, 6, m.viewCount(), st.plain);
+            num(x, 7, m.plsqlCount(), st.plain);
+            num(x, 8, m.synonyms().size(), st.plain);
+            num(x, 9, m.grants().size(), st.plain);
         }
         row++;
         header(s, row++, st, "Severity", "Findings");
@@ -75,7 +80,7 @@ public class ExcelReportWriter {
         for (SchemaModel m : r.models()) {
             for (String w : m.warnings()) put(s, row++, 0, m.nickname() + ": " + w, st.plain);
         }
-        widths(s, 28, 18, 12, 12, 12, 12);
+        widths(s, 28, 18, 12, 12, 12, 12, 12, 14, 12, 12);
     }
 
     private void tableMatrix(Workbook wb, Styles st, ComparisonResult r) {

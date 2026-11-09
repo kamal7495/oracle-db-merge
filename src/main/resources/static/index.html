@@ -309,7 +309,9 @@ function renderResult(r) {
     el('p', {}, el('strong', { textContent: r.differenceCount + ' difference(s). ' }),
       el('a', { href: r.htmlReport, target: '_blank', rel: 'noopener', textContent: 'Open HTML report' }), ' · ',
       el('a', { href: r.excelReport, textContent: 'Download Excel report' })),
-    chips);
+    chips,
+    el('p', { className: 'phases', textContent: r.databases.map(d => d.nickname + ': ' + d.tables + ' tables, '
+      + d.views + ' views, ' + d.plsql + ' PL/SQL units, ' + d.synonyms + ' synonyms, ' + d.grants + ' grants').join(' · ') }));
   const warn = r.databases.flatMap(d => d.warnings.map(w => d.nickname + ': ' + w));
   if (warn.length) root.append(el('p', { className: 'err', textContent: warn.length + ' extraction warning(s) — see report.' }));
   if (!r.differences.length) { root.append(el('p', { className: 'good', textContent: 'No structural differences.' })); return; }
@@ -320,7 +322,8 @@ function renderResult(r) {
   const tb = el('tbody');
   for (const d of r.differences) {
     const tr = el('tr', {}, el('td', {}, el('span', { className: 'badge ' + d.severity, textContent: d.severity })),
-      el('td', { textContent: d.kind }), el('td', { textContent: d.object }));
+      el('td', { textContent: d.kind }),
+      el('td', {}, d.object, el('div', { className: 'phases', textContent: d.description || '' })));
     for (const db of dbs) {
       const v = d.values[db] || '';
       tr.append(el('td', { className: v.startsWith('(') ? 'miss' : '', textContent: v }));
