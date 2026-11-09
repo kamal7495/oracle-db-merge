@@ -32,8 +32,9 @@ class HashCompareTest {
     static final class FakeSource implements HashCompare.Source {
         final Map<String, List<Map<String, String>>> rows;
         final List<String> key, pk, compared;
-        final List<String> drilled = new ArrayList<>();
-        int fullRowsFetched;
+        final List<String> drilled = java.util.Collections.synchronizedList(new ArrayList<>());
+        final java.util.concurrent.atomic.AtomicInteger fetched = new java.util.concurrent.atomic.AtomicInteger();
+        // the comparison queries the databases in parallel, so these are updated from several threads
 
         FakeSource(Map<String, List<Map<String, String>>> rows, List<String> key, List<String> pk, List<String> compared) {
             this.rows = rows;
@@ -119,8 +120,9 @@ class HashCompareTest {
         }
 
         @Override
-        public Map<String, Map<String, String>> rows(String db, Collection<String> keyHashes) {
-            fullRowsFetched += keyHashes.size();
+        public Map<String, Map<String, String>> rows(String db, Map<String, List<Object>> keys) {
+            Collection<String> keyHashes = keys.keySet();
+            fetched.addAndGet(keyHashes.size());
             Map<String, Map<String, String>> out = new LinkedHashMap<>();
             for (Map<String, String> r : rows.getOrDefault(db, List.of())) if (keyHashes.contains(kh(r))) out.putIfAbsent(kh(r), r);
             return out;
@@ -213,7 +215,7 @@ class HashCompareTest {
         RowMatcher.Output o = HashCompare.run(new HashCompare.Input(List.of("A", "B"), all, true, true, 20, 100), src);
         assertEquals(500, o.identicalCount());
         assertTrue(src.drilled.isEmpty(), "nothing to drill into: " + src.drilled);
-        assertEquals(0, src.fullRowsFetched);
+        assertEquals(0, src.fetched.get());
 
         // One changed row: only its bucket is read, and only that row is fetched in full.
         data.get("B").set(42, row("42", "C42", "changed", "1"));
@@ -223,8 +225,9 @@ class HashCompareTest {
         assertEquals(1, o.conflictCount());
         assertEquals(List.of("NAME"), o.conflicts().get(0).differingColumns());
         assertEquals(2, src.drilled.size(), "one bucket list per database");
-        assertTrue(src.drilled.get(0).matches("A\\[\\d+]"), src.drilled.toString());
-        assertEquals(2, src.fullRowsFetched, "the conflicting row from each database");
+        assertTrue(src.drilled.stream().sorted().toList().get(0).matches("A\\[\\d+]"), src.drilled.toString());
+        assertTrue(src.drilled.stream().anyMatch(d -> d.startsWith("B")), src.drilled.toString());
+        assertEquals(2, src.fetched.get(), "the conflicting row from each database");
     }
 
     @Test
@@ -239,7 +242,7 @@ class HashCompareTest {
         RowMatcher.Output o = HashCompare.run(new HashCompare.Input(List.of("A", "B"), all, true, true, 9, 25), src);
         assertEquals(300L, o.onlyInCounts().get("A"));
         assertEquals(25, o.onlyRows().size());
-        assertEquals(25, src.fullRowsFetched);
+        assertEquals(25, src.fetched.get());
     }
 
     @Test
@@ -260,5 +263,24 @@ class HashCompareTest {
         assertEquals(2, HashCompare.bucketsFor(10_001, 10_000));
         assertEquals(1_000, HashCompare.bucketsFor(10_000_000, 10_000));
         assertEquals(1_000_000, HashCompare.bucketsFor(Long.MAX_VALUE, 10_000));
+    }
+
+    @Test
+    void databasesAreQueriedAtTheSameTime() throws Exception {
+        java.util.concurrent.CountDownLatch both = new java.util.concurrent.CountDownLatch(2);
+        Map<String, Integer> out = HashCompare.perDb(List.of("A", "B"), db -> {
+            both.countDown();
+            // each call waits for the other one: only possible when they run in parallel
+            try {
+                if (!both.await(5, java.util.concurrent.TimeUnit.SECONDS)) throw new java.sql.SQLException("ran one after the other");
+            } catch (InterruptedException ie) {
+                throw new java.sql.SQLException(ie);
+            }
+            return db.length();
+        });
+        assertEquals(List.of("A", "B"), List.copyOf(out.keySet()), "results keep the database order");
+        java.sql.SQLException e = org.junit.jupiter.api.Assertions.assertThrows(java.sql.SQLException.class,
+                () -> HashCompare.perDb(List.of("A", "B"), db -> { if (db.equals("B")) throw new java.sql.SQLException("B down"); return 1; }));
+        assertEquals("B down", e.getMessage());
     }
 }

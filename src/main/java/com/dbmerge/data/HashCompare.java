@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.TreeSet;
 
 /**
@@ -50,10 +51,18 @@ public final class HashCompare {
     }
 
     /** One row of a differing bucket: hashes plus the display form of its business key and primary key. */
-    public record KeyRow(int bucket, String keyHash, String keyDisplay, String pkDisplay, String dataHash) { }
+    public record KeyRow(int bucket, String keyHash, String keyDisplay, String pkDisplay, String dataHash, List<Object> rawKey) {
+        public KeyRow(int bucket, String keyHash, String keyDisplay, String pkDisplay, String dataHash) {
+            this(bucket, keyHash, keyDisplay, pkDisplay, dataHash, null);
+        }
+    }
 
     /** One row of a differing primary-key bucket. */
-    public record PkRow(int bucket, String pkHash, String pkDisplay, String keyHash, String keyDisplay) { }
+    public record PkRow(int bucket, String pkHash, String pkDisplay, String keyHash, String keyDisplay, List<Object> rawKey) {
+        public PkRow(int bucket, String pkHash, String pkDisplay, String keyHash, String keyDisplay) {
+            this(bucket, pkHash, pkDisplay, keyHash, keyDisplay, null);
+        }
+    }
 
     /** Forward-only cursor; {@link #next()} returns null at the end. */
     public interface Cursor<T> extends AutoCloseable {
@@ -73,8 +82,12 @@ public final class HashCompare {
 
         Cursor<PkRow> pkRows(String db, int buckets, List<Integer> which) throws SQLException;
 
-        /** Full rows (all compared columns) for the given key hashes: key hash -> row. */
-        Map<String, Map<String, String>> rows(String db, Collection<String> keyHashes) throws SQLException;
+        /**
+         * Full rows (all compared columns) for the given keys: key hash -> row. Each key hash comes with the row's raw
+         * business-key values as read by {@link #keyRows}/{@link #pkRows} (null when unknown), so a source can look
+         * rows up by key instead of hashing the whole table.
+         */
+        Map<String, Map<String, String>> rows(String db, Map<String, List<Object>> keys) throws SQLException;
     }
 
     public record Input(List<String> databases, List<String> comparedColumns, boolean keyIsPk, boolean hasPk,
@@ -95,7 +108,7 @@ public final class HashCompare {
 
         // ---- pass 1: business key
         Map<String, Map<Integer, BucketAgg>> aggs = new LinkedHashMap<>();
-        for (String db : dbs) aggs.put(db, index(src.keyBuckets(db, in.buckets())));
+        perDb(dbs, db -> index(src.keyBuckets(db, in.buckets()))).forEach(aggs::put);
         long identical = 0;
         Map<String, Long> duplicates = new LinkedHashMap<>();
         List<Integer> dirty = new ArrayList<>();
@@ -117,7 +130,7 @@ public final class HashCompare {
         if (!dirty.isEmpty()) {
             Map<String, Peeking<KeyRow>> cursors = new LinkedHashMap<>();
             try {
-                for (String db : dbs) cursors.put(db, new Peeking<>(src.keyRows(db, in.buckets(), dirty), KeyRow::bucket));
+                openAll(dbs, db -> new Peeking<>(src.keyRows(db, in.buckets(), dirty), KeyRow::bucket), cursors);
                 for (int b : dirty) {
                     Map<String, Map<String, KeyRow>> byKey = new LinkedHashMap<>();
                     for (String db : dbs) {
@@ -169,13 +182,13 @@ public final class HashCompare {
         List<Map<String, PkRow>> collisionSamples = new ArrayList<>();
         if (!in.keyIsPk() && in.hasPk()) {
             Map<String, Map<Integer, BucketAgg>> pkAggs = new LinkedHashMap<>();
-            for (String db : dbs) pkAggs.put(db, index(src.pkBuckets(db, in.buckets())));
+            perDb(dbs, db -> index(src.pkBuckets(db, in.buckets()))).forEach(pkAggs::put);
             List<Integer> pkDirty = new ArrayList<>();
             for (int b : allBuckets(pkAggs)) if (!clean(pkAggs, b)) pkDirty.add(b);
             if (!pkDirty.isEmpty()) {
                 Map<String, Peeking<PkRow>> cursors = new LinkedHashMap<>();
                 try {
-                    for (String db : dbs) cursors.put(db, new Peeking<>(src.pkRows(db, in.buckets(), pkDirty), PkRow::bucket));
+                    openAll(dbs, db -> new Peeking<>(src.pkRows(db, in.buckets(), pkDirty), PkRow::bucket), cursors);
                     for (int b : pkDirty) {
                         Map<String, Map<String, PkRow>> byPk = new LinkedHashMap<>();
                         for (String db : dbs) {
@@ -200,13 +213,16 @@ public final class HashCompare {
         }
 
         // ---- full rows for the samples only
-        Map<String, Set<String>> wanted = new LinkedHashMap<>();
-        for (String db : dbs) wanted.put(db, new TreeSet<>());
-        for (int i = 0; i < onlySamples.size(); i++) wanted.get(onlySampleDbs.get(i)).add(onlySamples.get(i).keyHash());
-        for (Map<String, KeyRow> c : conflictSamples) c.forEach((db, r) -> wanted.get(db).add(r.keyHash()));
-        for (Map<String, PkRow> c : collisionSamples) c.forEach((db, r) -> wanted.get(db).add(r.keyHash()));
-        Map<String, Map<String, Map<String, String>>> full = new HashMap<>();
-        for (String db : dbs) full.put(db, wanted.get(db).isEmpty() ? Map.of() : src.rows(db, wanted.get(db)));
+        Map<String, Map<String, List<Object>>> wanted = new LinkedHashMap<>();
+        for (String db : dbs) wanted.put(db, new TreeMap<>());
+        for (int i = 0; i < onlySamples.size(); i++) {
+            KeyRow r = onlySamples.get(i);
+            wanted.get(onlySampleDbs.get(i)).put(r.keyHash(), r.rawKey());
+        }
+        for (Map<String, KeyRow> c : conflictSamples) c.forEach((db, r) -> wanted.get(db).put(r.keyHash(), r.rawKey()));
+        for (Map<String, PkRow> c : collisionSamples) c.forEach((db, r) -> wanted.get(db).put(r.keyHash(), r.rawKey()));
+        Map<String, Map<String, Map<String, String>>> full = new HashMap<>(
+                perDb(dbs, db -> wanted.get(db).isEmpty() ? Map.of() : src.rows(db, wanted.get(db))));
 
         List<OnlyRow> onlyRows = new ArrayList<>();
         for (int i = 0; i < onlySamples.size(); i++) {
@@ -249,6 +265,65 @@ public final class HashCompare {
         }
         return new RowMatcher.Output(onlyCounts, identical, conflicts, collisions, divergences,
                 onlyRows, identicalRows, conflictRows, collisionRows, divergenceRows, warnings);
+    }
+
+    @FunctionalInterface
+    interface PerDb<T> {
+        T apply(String db) throws SQLException;
+    }
+
+    /**
+     * Runs {@code f} for every database at the same time. Each database has its own connection, so the queries run
+     * in parallel on the servers while each still reads one consistent snapshot. Results keep the database order.
+     */
+    static <T> Map<String, T> perDb(List<String> dbs, PerDb<T> f) throws SQLException {
+        Map<String, T> out = new LinkedHashMap<>();
+        if (dbs.size() == 1) {
+            out.put(dbs.get(0), f.apply(dbs.get(0)));
+            return out;
+        }
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(dbs.size(), r -> {
+            Thread t = new Thread(r, "dbmerge-hash");
+            t.setDaemon(true);
+            return t;
+        });
+        try {
+            Map<String, java.util.concurrent.Future<T>> futures = new LinkedHashMap<>();
+            for (String db : dbs) futures.put(db, pool.submit(() -> f.apply(db)));
+            SQLException first = null;
+            for (var e : futures.entrySet()) {
+                try {
+                    out.put(e.getKey(), e.getValue().get());
+                } catch (java.util.concurrent.ExecutionException ex) {
+                    Throwable c = ex.getCause();
+                    if (c instanceof SQLException se) { if (first == null) first = se; }
+                    else if (c instanceof RuntimeException re) throw re;
+                    else throw new IllegalStateException(c);
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                    throw new SQLException("Interrupted while comparing", ex);
+                }
+            }
+            if (first != null) throw first;
+            return out;
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    /** Opens one cursor per database in parallel (each query sorts before its first row); closes them all on failure. */
+    private static <T> void openAll(List<String> dbs, PerDb<Peeking<T>> open, Map<String, Peeking<T>> into) throws SQLException {
+        Map<String, Peeking<T>> opened = new LinkedHashMap<>();
+        try {
+            // keep successfully opened cursors even if another database fails, so the caller closes them
+            perDb(dbs, db -> {
+                Peeking<T> p = open.apply(db);
+                synchronized (opened) { opened.put(db, p); }
+                return p;
+            });
+        } finally {
+            for (String db : dbs) if (opened.containsKey(db)) into.put(db, opened.get(db));
+        }
     }
 
     private static Map<Integer, BucketAgg> index(List<BucketAgg> list) {

@@ -190,13 +190,13 @@ Not compared yet: public synonyms, system and role privileges, database links, s
 
 ### How large tables are compared
 
-1. Each database hashes every row with `STANDARD_HASH` (Oracle 12c or later): one hash of the business key, one of the primary key, one of the compared columns. Rows are spread over buckets (about 10 000 rows each) by key hash, so a key lands in the same bucket everywhere.
+1. Each database hashes every row with `STANDARD_HASH` (Oracle 12c or later): one hash of the business key, one of the primary key, one of the compared columns. Short values (numbers, dates, codes up to 200 bytes) are written inline as `V<length>:<text>` and hashed together, so a row costs about three MD5 calls whatever its width; long text, LOBs and national-character columns are hashed on their own first. Rows are spread over buckets (about 10 000 rows each) by key hash, so a key lands in the same bucket everywhere.
 2. Each database returns one line per bucket: rows, distinct keys, and the sum of a row hash. Buckets that match in every database are counted as identical and never read.
 3. The other buckets are streamed from all databases together, ordered by bucket, as hashes and key values only, one bucket at a time. That classifies only-in-one, identical, conflicts and PK divergences with exact counts.
 4. When the business key is not the primary key, a second pass buckets by primary-key hash to find **PK collisions**.
-5. Only the sample rows shown in the report (`dbmerge.sample-limit` per category) are fetched in full. That is how conflicts get their column-level differences.
+5. Only the sample rows shown in the report (`dbmerge.sample-limit` per category) are fetched in full, looked up by their key values (through the key's index) rather than by hashing the table again. That is how conflicts get their column-level differences.
 
-Each database runs about six full scans of the table, on its own read-only connection, so a table is compared within one snapshot. Each query has a 30-minute timeout (`DataCompareService.DEFAULT_HASH_QUERY_TIMEOUT_SECONDS`). Identical rows are counted but not listed.
+Every step runs in all databases **at the same time**, each on its own read-only connection, so a table is still compared within one snapshot per database. Each database scans the table twice (bucket totals, then the rows of differing buckets). Each query has a 30-minute timeout (`DataCompareService.DEFAULT_HASH_QUERY_TIMEOUT_SECONDS`). Identical rows are counted but not listed.
 
 Values are hashed in a canonical form that does not depend on session NLS settings:
 
@@ -319,13 +319,25 @@ Results for 1 million trades (MacBook, Colima VM with 4 CPUs and 6 GB, Oracle Fr
 |---|---|---|---|
 | `ddl PERF_A PERF_B` | 3 s | 235 MB | the 3 planted schema changes (plus the backup table and grant without the filter) |
 | `refs PERF_A --check-data` (filtered) | 3 s | 230 MB | 9 findings, all real: every planted reference, with 100 % resolution, and the ambiguous `TRADE.PRODUCT_ID` resolved by data (100 % to `PRODUCT_DESC`, 20 % to `PRODUCT_BOND`) |
-| `data PERF_A PERF_B` (all tables, hash) | 200 s | 665 MB | exact: `TRADE` 1 000 conflicts / 300 only in one, `TRADE_KEYWORD` 500 / 600, `BO_MESSAGE` 0 / 200 |
-| `data --tables TRADE --max-rows 0` | 52 s | 290 MB | as above for `TRADE` |
+| `data PERF_A PERF_B` (all tables, hash) | 44 s | 800 MB | exact: `TRADE` 1 000 conflicts / 300 only in one, `TRADE_KEYWORD` 500 / 600, `BO_MESSAGE` 0 / 200. Memory is mostly `PRODUCT_DESC` (200 000 rows, compared in memory) |
+| `data --tables TRADE --max-rows 0` | 14 s | 350 MB | as above for `TRADE` |
 | `snapshot` + `ddl PERF_B --snapshot` | 3 s each | 235 MB | a 42 KB snapshot; live `PERF_A` vs its snapshot shows 0 differences, `PERF_B` the 3 changes |
 
-Memory stays flat as tables grow: it follows the number of differing rows, not the table size. Time is dominated by
-the database's full scans, about 50 s per million rows of a wide table on this container. The same comparison with
-`--max-rows 200000` (the in-memory path) gives identical counts at 10 000 trades.
+Memory stays flat as tables grow: it follows the number of differing rows, not the table size. Time is the
+databases' hashing, about 10 s per million rows of a wide table on this container.
+
+Against [reladiff](https://github.com/erezsh/reladiff) 0.6 (hashdiff, the cross-database algorithm) on the same data,
+both report exactly the same differences:
+
+| Table | oracle-db-merge | reladiff, 1 thread | reladiff, 4 threads |
+|---|---|---|---|
+| `TRADE`, 1 M rows, numeric key | 14 s | 48.5 s | 20.6 s |
+| `TRADE_KEYWORD`, 3 M rows, two-column key | 28 s | 372.9 s | 158.6 s |
+| `BO_MESSAGE`, 1 M rows, numeric key | 11 s | 14.1 s | 8.5 s |
+
+oracle-db-merge times include starting the JVM and reading the schema (about 5 s per run). An earlier build took
+59 / 84 / 25 s: it hashed every column separately, queried the databases one after the other and found the report's
+sample rows by hashing the table again. Oracle's own statistics (`V$SQL`) showed the time was CPU spent hashing.
 
 ## Layout
 
