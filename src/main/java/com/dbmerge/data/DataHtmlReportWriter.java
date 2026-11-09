@@ -41,7 +41,8 @@ public class DataHtmlReportWriter {
                 h.append("<td>").append(t.onlyInTotal()).append("</td><td>").append(t.identicalCount()).append("</td><td")
                         .append(t.conflictCount() > 0 ? " class=\"warn\"" : "").append(">").append(t.conflictCount()).append("</td><td")
                         .append(t.pkCollisionCount() > 0 ? " class=\"bad\"" : "").append(">").append(t.pkCollisionCount()).append("</td><td>")
-                        .append(t.pkDivergenceCount()).append("</td><td>").append(t.warnings().isEmpty() ? "compared" : "compared, " + t.warnings().size() + " warning(s)").append("</td>");
+                        .append(t.pkDivergenceCount()).append("</td><td>").append(t.message() != null ? "compared by hash" : "compared")
+                        .append(t.warnings().isEmpty() ? "" : ", " + t.warnings().size() + " warning(s)").append("</td>");
             } else {
                 h.append("<td colspan=\"5\">").append(esc(t.message())).append("</td><td>").append(esc(t.status().name())).append("</td>");
             }
@@ -60,6 +61,7 @@ public class DataHtmlReportWriter {
         h.append("<details id=\"t-").append(esc(t.table())).append("\"><summary>").append(esc(t.table())).append(" &mdash; ")
                 .append(t.onlyInTotal()).append(" only-in-one, ").append(t.identicalCount()).append(" identical, ")
                 .append(t.conflictCount()).append(" conflicts, ").append(t.pkCollisionCount()).append(" PK collisions</summary>");
+        if (t.message() != null) h.append("<p class=\"muted\">").append(esc(t.message())).append("</p>");
         for (String w : t.warnings()) h.append("<p class=\"warnbox\">").append(esc(w)).append("</p>");
         h.append("<p class=\"muted\">Business key: ").append(esc(String.join(", ", t.keyColumns())))
                 .append(" &middot; primary key: ").append(esc(String.join(", ", t.pkColumns())))

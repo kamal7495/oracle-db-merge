@@ -59,7 +59,7 @@ final class CliHelp {
                     present in only one database.
                       --tables T1,T2       only these tables (repeatable)
                       --key TABLE=COLS     business key for a table (repeatable)
-                      --allow-uncompared   don't fail on tables that could not be compared (no key, too large, error)
+                      --allow-uncompared   don't fail on tables that could not be compared (no key, error)
                     """ + COMMON;
             case REFS -> """
                     Usage: cli refs A [--check-data [--timeout S] [--max-checks N]] [--fail-on CONFIDENCE] [common options]

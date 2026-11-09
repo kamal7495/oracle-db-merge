@@ -44,7 +44,7 @@ public final class ExitCodes {
     /**
      * data: fails on any difference: rows only in some databases, conflicts, primary-key collisions or divergence,
      * different row counts, or a table present in only one database. Tables that could not be compared (no key,
-     * too large, error) also fail unless {@code allowUncompared}, so a CI run never passes on data it never read.
+     * error) also fail unless {@code allowUncompared}, so a CI run never passes on data it never read.
      */
     public static int data(List<TableDataResult> tables, boolean allowUncompared) {
         for (TableDataResult t : tables) {

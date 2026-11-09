@@ -3,12 +3,12 @@
 Compare and merge **N Oracle databases into one master**. Java 17, Maven, `ojdbc11`, Spring Boot 3.3 and a small web UI.
 
 * **Phase 1** – extract DDL from every database (tables, sequences, triggers, views, materialized views, PL/SQL, synonyms, grants), compare all of them against each other, classify each difference by severity, report as HTML and Excel.
-* **Phase 2** – per-table row counts, matches and conflicts on a business key you choose (default: primary key), report as HTML and Excel.
+* **Phase 2** – per-table row counts, matches and conflicts on a business key you choose (default: primary key), report as HTML and Excel. Large tables are compared with server-side hashes, with no row limit.
 * **Phase 3** – merge the others into the master you choose: dependency-ordered, collision-safe, dry-run by default, one transaction, validated before commit.
 * **Undeclared references** – for one schema, list the columns that act like foreign keys but have no FOREIGN KEY constraint, optionally checked against the data. Run this before merging a schema whose integrity lives in the application (typical of vendor packages such as trading systems).
 
 > **Status of this build – read this first.**
-> `mvn verify` passes: the unit tests plus the Testcontainers integration tests against Oracle Free 23 (`SchemaExtractorIT`, `MergeIT`, `LobMergeIT`, `ReferenceIT`). These cover extraction, the Phase 2 comparison, planning, executing, rolling back and validating merges (including BLOB/CLOB columns), and the undeclared-reference detection with its data check.
+> `mvn verify` passes: the unit tests plus the Testcontainers integration tests against Oracle Free 23 (`SchemaExtractorIT`, `MergeIT`, `LobMergeIT`, `ReferenceIT`, `DataHashCompareIT`). These cover extraction, the Phase 2 comparison (in memory and by server-side hash), planning, executing, rolling back and validating merges (including BLOB/CLOB columns), and the undeclared-reference detection with its data check.
 > **Not covered by any test:** the REST controllers, the web UI and the Excel report writers. The server starts and serves the UI, but these have not been exercised end to end.
 > **Do not point the executor at a real master before a dry run on a copy and a Data Pump backup.**
 
@@ -58,7 +58,7 @@ java -jar target/oracle-db-merge-*.jar cli help            # or: cli <command> -
 |---|---|---|
 | `connections [--test]` | lists saved and configured connections; `--test` connects to each | `--test` and a connection fails or is locked (exit 3) |
 | `ddl A B [C...]` | Phase 1 comparison, writes `ddl-<id>.html` and `.xlsx` | a difference at or above `--fail-on` (`CRITICAL`, `HIGH` default, `MEDIUM`, `LOW`, `NEVER`) |
-| `data A B [C...]` | Phase 2 comparison, writes `data-<id>.html` and `.xlsx`. `--tables T1,T2`, `--key TABLE=COL1,COL2` | any difference: rows only in some databases, conflicts, key collisions, different row counts, a table in only one database. Tables that could not be compared (no key, too large, error) also fail unless `--allow-uncompared` |
+| `data A B [C...]` | Phase 2 comparison, writes `data-<id>.html` and `.xlsx`. `--tables T1,T2`, `--key TABLE=COL1,COL2` | any difference: rows only in some databases, conflicts, key collisions, different row counts, a table in only one database. Tables that could not be compared (no key, error) also fail unless `--allow-uncompared` |
 | `refs A` | undeclared-reference report, writes `refs-<id>.html`. `--check-data [--timeout S] [--max-checks N]` | a candidate at or above `--fail-on` confidence (`HIGH` default, `MEDIUM`, `LOW`, `NEVER`) |
 | `plan --master M S [S...]` | merge **dry run**, writes `merge-<id>.html` and the review `.sql`. `--key`, `--ack TABLE.COLUMN`, `--sequence TABLE=SEQ`, `--orphans fail\|skip`, `--rules FILE` | any blocker (including unresolved conflicts and undeclared references that would break); also warnings with `--fail-on-warnings` |
 
@@ -141,8 +141,32 @@ Not compared yet: public synonyms, system and role privileges, database links, s
 ## Phase 2 notes
 
 * Business key defaults to the primary key. If the key is not the PK, same-PK-different-record cases are reported as **PK collisions**; same-key-different-PK as **PK divergence**.
-* Rows are compared in memory. Tables above `dbmerge.max-rows-per-table` (default 200 000) are counted but not compared.
+* Tables up to `dbmerge.max-rows-per-table` (default 200 000) are compared in memory. **Larger tables are compared with hashes computed in the databases**, so there is no row limit and memory follows the number of differing rows, not the table size. The report marks these tables *compared by hash*, with a note saying how and which columns were left out.
 * Report sections: only in one DB, identical in several, different in several (column-level diffs), PK collisions.
+
+### How large tables are compared
+
+1. Each database hashes every row with `STANDARD_HASH` (Oracle 12c or later): one hash of the business key, one of the primary key, one of the compared columns. Rows are spread over buckets (about 10 000 rows each) by key hash, so a key lands in the same bucket everywhere.
+2. Each database returns one line per bucket: rows, distinct keys, and the sum of a row hash. Buckets that match in every database are counted as identical and never read.
+3. The other buckets are streamed from all databases together, ordered by bucket, as hashes and key values only, one bucket at a time. That classifies only-in-one, identical, conflicts and PK divergences with exact counts.
+4. When the business key is not the primary key, a second pass buckets by primary-key hash to find **PK collisions**.
+5. Only the sample rows shown in the report (`dbmerge.sample-limit` per category) are fetched in full. That is how conflicts get their column-level differences.
+
+Each database runs about six full scans of the table, on its own read-only connection, so a table is compared within one snapshot. Each query has a 30-minute timeout (`DataCompareService.DEFAULT_HASH_QUERY_TIMEOUT_SECONDS`). Identical rows are counted but not listed.
+
+Values are hashed in a canonical form that does not depend on session NLS settings:
+
+| Type | Hashed as |
+|---|---|
+| NUMBER, FLOAT, BINARY_FLOAT/DOUBLE | `TO_CHAR(x, 'TM9')` with `.` as decimal sign. `1.50` in NUMBER(10,2) equals `1.5` in NUMBER. Binary floats compare by their shortest decimal text. |
+| DATE, TIMESTAMP | explicit `SYYYY-MM-DD HH24:MI:SS[.FF9]` |
+| TIMESTAMP WITH (LOCAL) TIME ZONE | converted to UTC first: the same instant written in two time zones is **equal** (the in-memory path, which compares JDBC text, calls it a conflict) |
+| VARCHAR2, CHAR, NVARCHAR2, NCHAR | the stored bytes, so the comparison is exact and case-sensitive. When the databases use different character sets, the text is converted to AL32UTF8 first (`UTL_I18N`) and the note says so. CHAR keeps its blank padding, so CHAR(10) vs CHAR(12) differ. |
+| RAW, ROWID, INTERVAL | bytes / text |
+| CLOB, NCLOB, BLOB | `DBMS_CRYPTO.HASH`, **only when every database lets the user execute `DBMS_CRYPTO`** (it is not granted by default). Otherwise these columns are left out and the note lists them. |
+| LONG, LONG RAW, XMLTYPE, BFILE, UROWID, object types | never hashed; listed as not compared |
+
+NULL and empty LOBs get their own markers, so they never equal a value. Key columns must be of a hashable, non-LOB type. A column whose type differs between databases (e.g. NUMBER vs VARCHAR2) gets a warning, since equal values can hash differently. Row hashes are compared through 60-bit sums per bucket. A false "identical" would need two different sets of rows with the same row count, the same distinct-key count and the same 60-bit sum: possible in principle, not by accident.
 
 ## Undeclared references
 
@@ -198,7 +222,8 @@ Limits: detection works from names, so it misses references whose names do not m
 * Only NOT NULL, text length and type conversion are checked while planning. **UNIQUE constraints other than the business key, CHECK constraints** and other DB rules are not pre-validated: the database enforces them during the run and a violation rolls the whole data transaction back (the `MergeIT` rollback test uses this). Example: the business key is the PK and a source row brings a new ID with an e-mail the master already has.
 * Planning straight after a schema change (e.g. a run whose approved `CREATE TABLE` committed but whose data step rolled back) can hit `ORA-01466` because reads use `READ ONLY` transactions. Reads retry automatically for about 10 seconds.
 * Business-key columns should be natural columns (e-mail, SKU), **not foreign-key columns**: keys are compared on source values before FK rewriting.
-* Everything is processed in memory (`max-rows-per-table`). Large tables need a different approach (staging tables / Data Pump / `MERGE`).
+* The **merge** (Phase 3) is processed in memory (`max-rows-per-table`). Large tables need a different approach (staging tables / Data Pump / `MERGE`). Only the Phase 2 *comparison* handles large tables, with server-side hashes (see [How large tables are compared](#how-large-tables-are-compared)).
+* Hash comparisons of large tables run about six full scans per database. Under heavy write load a long read-only snapshot can hit `ORA-01555` (snapshot too old). Run them on a standby or a quiet period, or raise `UNDO_RETENTION`.
 * FK cycles between tables are blocked rather than solved.
 * **LOBs.** BLOB, CLOB and NCLOB are read whole, compared byte for byte / character for character, and written through bind variables. `LobMergeIT` covers 1–2 MB BLOBs, a 100 000-character Unicode CLOB, NULLs, empty LOBs (`EMPTY_BLOB()`/`EMPTY_CLOB()` stay empty, not NULL) and FK rewriting on tables with LOBs. Limits:
   * Each LOB is held in memory, plus a hex copy of each BLOB (about twice its size) for comparison. `max-rows-per-table` caps rows, not bytes, so tables of large documents or images can exhaust the heap. They need a streaming/hash-based approach.

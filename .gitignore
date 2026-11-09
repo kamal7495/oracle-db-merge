@@ -4,3 +4,4 @@ config/application-local.yml
 *.dmp
 .idea/
 *.iml
+.claude/
