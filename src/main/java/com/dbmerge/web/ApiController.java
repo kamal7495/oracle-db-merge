@@ -124,6 +124,10 @@ public class ApiController {
             d.put("schema", m.owner());
             d.put("tables", m.tables().size());
             d.put("sequences", m.sequences().size());
+            d.put("views", m.viewCount());
+            d.put("plsql", m.plsqlCount());
+            d.put("synonyms", m.synonyms().size());
+            d.put("grants", m.grants().size());
             d.put("warnings", m.warnings());
             dbs.add(d);
         }

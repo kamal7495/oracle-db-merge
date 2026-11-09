@@ -45,11 +45,14 @@ public class HtmlReportWriter {
     // ---------------------------------------------------------------- sections
 
     private void databases(StringBuilder h, ComparisonResult r) {
-        h.append("<h2>Databases</h2><table><tr><th>Nickname</th><th>Schema</th><th>Tables</th><th>Columns</th><th>Sequences</th><th>Extraction warnings</th></tr>");
+        h.append("<h2>Databases</h2><table><tr><th>Nickname</th><th>Schema</th><th>Tables</th><th>Columns</th><th>Sequences</th>"
+                + "<th>Views</th><th>PL/SQL units</th><th>Synonyms</th><th>Grants</th><th>Extraction warnings</th></tr>");
         for (SchemaModel m : r.models()) {
             h.append("<tr><td>").append(esc(m.nickname())).append("</td><td>").append(esc(m.owner())).append("</td><td>")
                     .append(m.tables().size()).append("</td><td>").append(m.columnCount()).append("</td><td>")
-                    .append(m.sequences().size()).append("</td><td>").append(m.warnings().size()).append("</td></tr>");
+                    .append(m.sequences().size()).append("</td><td>").append(m.viewCount()).append("</td><td>")
+                    .append(m.plsqlCount()).append("</td><td>").append(m.synonyms().size()).append("</td><td>")
+                    .append(m.grants().size()).append("</td><td>").append(m.warnings().size()).append("</td></tr>");
         }
         h.append("</table>");
     }
@@ -67,8 +70,11 @@ public class HtmlReportWriter {
         }
         h.append("<p class=\"muted\">Severity = how likely the difference is to block or corrupt a merge, judged without knowing which database "
                 + "will be the master. CRITICAL: incompatible data types or a different/missing primary key. HIGH: missing table, "
-                + "length/precision mismatch, missing foreign/unique key, NOT NULL column with no default. MEDIUM: nullability, "
-                + "check constraints, triggers, sequences, compatible type changes. LOW: names, defaults, enabled/disabled flags.</p>");
+                + "length/precision mismatch, missing foreign/unique key, NOT NULL column with no default, missing view, "
+                + "materialized view or PL/SQL unit. MEDIUM: nullability, check constraints, triggers, sequences, compatible type "
+                + "changes, changed view/PL/SQL source, VALID vs INVALID, missing synonym or grant. LOW: names, defaults, "
+                + "enabled/disabled flags, grant option. Source is compared without comments, whitespace, case or the schema's own "
+                + "name as a prefix; only the first differing line is shown.</p>");
     }
 
     private void tableMatrix(StringBuilder h, ComparisonResult r) {

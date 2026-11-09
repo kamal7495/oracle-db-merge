@@ -17,7 +17,18 @@ public enum DiffKind {
     SEQUENCE_PARAM_MISMATCH("SEQUENCE", "Sequence parameters differ"),
     MISSING_TRIGGER("TRIGGER", "Missing trigger"),
     TRIGGER_DEFINITION_MISMATCH("TRIGGER", "Trigger definition differs"),
-    TRIGGER_STATUS_MISMATCH("TRIGGER", "Trigger enabled/disabled differs");
+    TRIGGER_STATUS_MISMATCH("TRIGGER", "Trigger enabled/disabled differs"),
+    MISSING_VIEW("VIEW", "Missing view"),
+    VIEW_DEFINITION_MISMATCH("VIEW", "View definition differs"),
+    MISSING_MVIEW("MVIEW", "Missing materialized view"),
+    MVIEW_DEFINITION_MISMATCH("MVIEW", "Materialized view definition differs"),
+    MISSING_PLSQL("PLSQL", "Missing PL/SQL object"),
+    PLSQL_SOURCE_MISMATCH("PLSQL", "PL/SQL source differs"),
+    OBJECT_STATUS_MISMATCH("CODE", "Valid / invalid differs"),
+    MISSING_SYNONYM("SYNONYM", "Missing synonym"),
+    SYNONYM_TARGET_MISMATCH("SYNONYM", "Synonym target differs"),
+    MISSING_GRANT("GRANT", "Missing grant"),
+    GRANT_OPTION_MISMATCH("GRANT", "Grant option differs");
 
     private final String category;
     private final String label;

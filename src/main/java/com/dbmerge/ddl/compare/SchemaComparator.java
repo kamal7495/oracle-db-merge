@@ -1,10 +1,14 @@
 package com.dbmerge.ddl.compare;
 
+import com.dbmerge.ddl.model.CodeObjectDef;
 import com.dbmerge.ddl.model.ColumnDef;
 import com.dbmerge.ddl.model.ConstraintDef;
+import com.dbmerge.ddl.model.GrantDef;
 import com.dbmerge.ddl.model.IndexDef;
 import com.dbmerge.ddl.model.SchemaModel;
 import com.dbmerge.ddl.model.SequenceDef;
+import com.dbmerge.ddl.model.SourceNormalizer;
+import com.dbmerge.ddl.model.SynonymDef;
 import com.dbmerge.ddl.model.TableDef;
 import com.dbmerge.ddl.model.TriggerDef;
 import java.time.Instant;
@@ -26,7 +30,9 @@ import java.util.stream.Collectors;
  * carries one value per database, so any pair can be read off the same row.
  *
  * Deliberately ignored: column order, storage/tablespace attributes, sequence LAST_NUMBER, system-generated
- * constraint/index names, and NOT NULL check constraints (covered by column nullability).
+ * constraint/index names, and NOT NULL check constraints (covered by column nullability). Views and PL/SQL are
+ * compared on their canonical source (see {@link SourceNormalizer}), so comments, whitespace, case and the
+ * schema's own name used as a prefix do not count.
  */
 public class SchemaComparator {
 
@@ -66,6 +72,9 @@ public class SchemaComparator {
             }
         }
         compareSequences(dbs, models, diffs);
+        compareCodeObjects(dbs, models, diffs);
+        compareSynonyms(dbs, models, diffs);
+        compareGrants(dbs, models, diffs);
 
         diffs.sort(Comparator
                 .comparing((Difference d) -> d.severity().ordinal())
@@ -335,6 +344,163 @@ public class SchemaComparator {
                         null, name, v, "Sequence parameters differ (LAST_NUMBER is ignored)."));
             }
         }
+    }
+
+    // ------------------------------------------- views, materialized views, PL/SQL
+
+    /** Most databases listed in one "source differs" description. */
+    private static final int MAX_SOURCE_DIFFS_DESCRIBED = 3;
+
+    private void compareCodeObjects(List<String> dbs, List<SchemaModel> models, List<Difference> out) {
+        Set<String> all = new TreeSet<>();
+        for (SchemaModel m : models) all.addAll(m.codeObjects().keySet());
+        for (String key : all) {
+            Map<String, CodeObjectDef> has = new LinkedHashMap<>();
+            for (SchemaModel m : models) {
+                CodeObjectDef o = m.codeObjects().get(key);
+                if (o != null) has.put(m.nickname(), o);
+            }
+            CodeObjectDef any = has.values().iterator().next();
+            String object = any.type() + " " + any.name();
+            Map<String, String> v = new LinkedHashMap<>();
+            for (String db : dbs) v.put(db, has.containsKey(db) ? has.get(db).summary() : MISSING);
+
+            if (has.size() < dbs.size()) {
+                out.add(new Difference(missingKind(any.type()), Severity.HIGH, null, object, v,
+                        label(any.type()) + " exists in " + names(has.keySet()) + " but not in "
+                                + names(missingFrom(dbs, has.keySet())) + "."));
+            }
+            if (has.size() < 2) continue;
+
+            if (has.values().stream().map(CodeObjectDef::hash).distinct().count() > 1) {
+                out.add(new Difference(mismatchKind(any.type()), Severity.MEDIUM, null, object, v,
+                        describeSourceDiff(has)));
+            }
+            Set<String> statuses = has.values().stream().map(o -> o.status() == null ? "?" : o.status())
+                    .collect(Collectors.toCollection(TreeSet::new));
+            if (statuses.size() > 1) {
+                Map<String, String> sv = new LinkedHashMap<>();
+                for (String db : dbs) sv.put(db, has.containsKey(db) ? String.valueOf(has.get(db).status()) : MISSING);
+                out.add(new Difference(DiffKind.OBJECT_STATUS_MISMATCH, Severity.MEDIUM, null, object, sv,
+                        label(any.type()) + " is " + String.join(" in some databases and ", statuses) + " in others."
+                                + " An INVALID object fails when it is used: recompile it and check ALL_ERRORS."));
+            }
+        }
+    }
+
+    /** Names the first differing line of each database whose source differs from the first database's. */
+    private static String describeSourceDiff(Map<String, CodeObjectDef> has) {
+        List<Map.Entry<String, CodeObjectDef>> list = new ArrayList<>(has.entrySet());
+        Map.Entry<String, CodeObjectDef> ref = list.get(0);
+        StringBuilder b = new StringBuilder();
+        int described = 0;
+        int more = 0;
+        for (Map.Entry<String, CodeObjectDef> e : list.subList(1, list.size())) {
+            SourceNormalizer.FirstDifference d = SourceNormalizer.firstDifference(ref.getValue().lines(), e.getValue().lines());
+            if (d == null) continue;
+            if (described == MAX_SOURCE_DIFFS_DESCRIBED) { more++; continue; }
+            b.append(described == 0 ? " First difference: " : "; ")
+                    .append(ref.getKey()).append(" line ").append(d.lineA()).append(" `").append(d.textA()).append("` vs ")
+                    .append(e.getKey()).append(" line ").append(d.lineB()).append(" `").append(d.textB()).append('`');
+            described++;
+        }
+        if (more > 0) b.append("; ").append(more).append(" more database(s) differ");
+        boolean sourceDiffers = described + more > 0;
+        boolean optionsDiffer = has.values().stream().map(CodeObjectDef::options).distinct().count() > 1;
+        String head = sourceDiffers && optionsDiffer ? "Source and options differ (comments, whitespace and case are ignored)."
+                : sourceDiffers ? "Source differs (comments, whitespace and case are ignored)."
+                : "Options differ: " + has.values().stream().map(CodeObjectDef::options).distinct()
+                        .collect(Collectors.joining(" vs ")) + ".";
+        return head + b;
+    }
+
+    private static DiffKind missingKind(String type) {
+        return switch (type) {
+            case "VIEW" -> DiffKind.MISSING_VIEW;
+            case "MATERIALIZED VIEW" -> DiffKind.MISSING_MVIEW;
+            default -> DiffKind.MISSING_PLSQL;
+        };
+    }
+
+    private static DiffKind mismatchKind(String type) {
+        return switch (type) {
+            case "VIEW" -> DiffKind.VIEW_DEFINITION_MISMATCH;
+            case "MATERIALIZED VIEW" -> DiffKind.MVIEW_DEFINITION_MISMATCH;
+            default -> DiffKind.PLSQL_SOURCE_MISMATCH;
+        };
+    }
+
+    private static String label(String type) {
+        String t = type.toLowerCase(java.util.Locale.ROOT);
+        return Character.toUpperCase(t.charAt(0)) + t.substring(1);
+    }
+
+    // --------------------------------------------------------------- synonyms
+
+    private void compareSynonyms(List<String> dbs, List<SchemaModel> models, List<Difference> out) {
+        Set<String> all = new TreeSet<>();
+        for (SchemaModel m : models) all.addAll(m.synonyms().keySet());
+        for (String name : all) {
+            Map<String, SynonymDef> has = new LinkedHashMap<>();
+            for (SchemaModel m : models) {
+                SynonymDef s = m.synonyms().get(name);
+                if (s != null) has.put(m.nickname(), s);
+            }
+            Map<String, String> v = new LinkedHashMap<>();
+            for (String db : dbs) v.put(db, has.containsKey(db) ? has.get(db).target() : MISSING);
+            if (has.size() < dbs.size()) {
+                out.add(new Difference(DiffKind.MISSING_SYNONYM, Severity.MEDIUM, null, "SYNONYM " + name, v,
+                        "Synonym exists in " + names(has.keySet()) + " but not in " + names(missingFrom(dbs, has.keySet()))
+                                + ". Code that uses it fails there."));
+            }
+            if (has.size() >= 2 && has.values().stream().map(SynonymDef::target).distinct().count() > 1) {
+                out.add(new Difference(DiffKind.SYNONYM_TARGET_MISMATCH, Severity.MEDIUM, null, "SYNONYM " + name, v,
+                        "Synonym points at different objects."));
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------- grants
+
+    private void compareGrants(List<String> dbs, List<SchemaModel> models, List<Difference> out) {
+        Set<String> all = new TreeSet<>();
+        for (SchemaModel m : models) all.addAll(m.grants().keySet());
+        for (String key : all) {
+            Map<String, GrantDef> has = new LinkedHashMap<>();
+            for (SchemaModel m : models) {
+                GrantDef g = m.grants().get(key);
+                if (g != null) has.put(m.nickname(), g);
+            }
+            GrantDef any = has.values().iterator().next();
+            String object = "GRANT " + any.privilege() + " ON " + any.objectName() + " TO " + any.grantee();
+            if (has.size() < dbs.size()) {
+                // A grant on an object that is itself missing is already covered by the missing-object finding.
+                List<String> lacking = new ArrayList<>();
+                Map<String, String> v = new LinkedHashMap<>();
+                for (SchemaModel m : models) {
+                    String db = m.nickname();
+                    if (has.containsKey(db)) v.put(db, has.get(db).grantable() ? "granted WITH GRANT OPTION" : "granted");
+                    else if (!objectExists(m, any.objectName())) v.put(db, "(object missing)");
+                    else { v.put(db, MISSING); lacking.add(db); }
+                }
+                if (!lacking.isEmpty()) {
+                    out.add(new Difference(DiffKind.MISSING_GRANT, Severity.MEDIUM, null, object, v,
+                            "Granted in " + names(has.keySet()) + " but not in " + names(lacking)
+                                    + ". Users or code relying on it get ORA-00942 / ORA-01031 there."));
+                }
+            }
+            if (has.size() >= 2 && has.values().stream().map(GrantDef::grantable).distinct().count() > 1) {
+                Map<String, String> v = new LinkedHashMap<>();
+                for (String db : dbs) v.put(db, has.containsKey(db) ? (has.get(db).grantable() ? "YES" : "NO") : MISSING);
+                out.add(new Difference(DiffKind.GRANT_OPTION_MISMATCH, Severity.LOW, null, object, v,
+                        "WITH GRANT OPTION differs."));
+            }
+        }
+    }
+
+    private static boolean objectExists(SchemaModel m, String name) {
+        if (m.tables().containsKey(name) || m.sequences().containsKey(name) || m.synonyms().containsKey(name)) return true;
+        return m.codeObjects().values().stream().anyMatch(o -> o.name().equals(name));
     }
 
     // ---------------------------------------------------------------- helpers

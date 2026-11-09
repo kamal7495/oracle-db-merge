@@ -2,7 +2,7 @@
 
 Compare and merge **N Oracle databases into one master**. Java 17, Maven, `ojdbc11`, Spring Boot 3.3 and a small web UI.
 
-* **Phase 1** – extract DDL from every database, compare all of them against each other, classify each difference by severity, report as HTML and Excel.
+* **Phase 1** – extract DDL from every database (tables, sequences, triggers, views, materialized views, PL/SQL, synonyms, grants), compare all of them against each other, classify each difference by severity, report as HTML and Excel.
 * **Phase 2** – per-table row counts, matches and conflicts on a business key you choose (default: primary key), report as HTML and Excel.
 * **Phase 3** – merge the others into the master you choose: dependency-ordered, collision-safe, dry-run by default, one transaction, validated before commit.
 * **Undeclared references** – for one schema, list the columns that act like foreign keys but have no FOREIGN KEY constraint, optionally checked against the data. Run this before merging a schema whose integrity lives in the application (typical of vendor packages such as trading systems).
@@ -64,11 +64,31 @@ By default a connection lasts until the app stops. Tick **Remember after restart
 | Severity | Examples |
 |---|---|
 | CRITICAL | incompatible data-type families (e.g. NUMBER vs VARCHAR2), missing or different primary key |
-| HIGH | table missing, length/precision mismatch, missing foreign key / unique constraint, NOT NULL column without default missing |
-| MEDIUM | nullability, check constraints, triggers, sequences, same-family type change |
-| LOW | names, defaults, enabled flags |
+| HIGH | table missing, length/precision mismatch, missing foreign key / unique constraint, NOT NULL column without default missing; missing view, materialized view, package, package body, procedure, function, type or type body |
+| MEDIUM | nullability, check constraints, triggers, sequences, same-family type change; changed view / materialized view / PL/SQL source; VALID vs INVALID; missing synonym or grant, synonym pointing elsewhere |
+| LOW | names, defaults, enabled flags, grant option (`WITH GRANT OPTION`) |
 
 Constraints and indexes are matched by structure (columns, type, referenced table), not by system-generated names. `NOT NULL` check constraints, identity defaults and sequence `LAST_NUMBER` are ignored.
+
+### Views, PL/SQL, synonyms and grants
+
+Besides tables and sequences, Phase 1 reads from the dictionary (read-only, like everything else):
+
+| Object | Source | Compared on |
+|---|---|---|
+| Views | `ALL_VIEWS.TEXT` | query text, status |
+| Materialized views | `ALL_MVIEWS` | query text, refresh method and mode, status |
+| Packages and bodies, procedures, functions, types and type bodies | `ALL_SOURCE` | source, status (`ALL_OBJECTS.STATUS`) |
+| Private synonyms owned by the schema | `ALL_SYNONYMS` | target object and DB link |
+| Object grants on the schema's objects | `ALL_TAB_PRIVS` (`TABLE_SCHEMA` = schema) | privilege, grantee, grant option |
+
+Objects are matched by type and name. Triggers are still compared with their table (body hash), as before. System-generated objects and the recycle bin are skipped.
+
+**Source is normalised before comparing**, so only real changes count: comments, whitespace (including line breaks, line endings and trailing blank lines), the case of keywords and unquoted identifiers, unnecessary quotes (`"TRADE"` = `TRADE`), the schema's own name as a prefix (`SAMPLE_A.TRADE` in one database = `SAMPLE_B.TRADE` in the other) and a leading `CREATE OR REPLACE [EDITIONABLE]` are ignored. String literals are compared exactly. When source differs, the finding names the **first differing line** in each database with a short excerpt (80 characters); whole bodies are never put in the reports or the API response. Wrapped (obfuscated) PL/SQL is compared as wrapped text.
+
+Synonyms that point into the schema itself are shown as `(own schema)`, so schemas with different names compare equal. A missing grant on an object that is itself missing in that database is not reported again (the missing object already is).
+
+Not compared yet: public synonyms, system and role privileges, database links, scheduler jobs, comments, partitioning, Java sources.
 
 ## Phase 2 notes
 
