@@ -45,6 +45,54 @@ mvn spring-boot:run -Dspring-boot.run.profiles=local
 
 An entry whose variable is empty is skipped (add it in the UI instead).
 
+## Command line
+
+The same jar runs comparisons without the web server, for CI jobs and scheduled checks:
+
+```bash
+java -jar target/oracle-db-merge-*.jar cli <command> [options] [connections...]
+java -jar target/oracle-db-merge-*.jar cli help            # or: cli <command> --help
+```
+
+| Command | What it does | Fails (exit 1) when |
+|---|---|---|
+| `connections [--test]` | lists saved and configured connections; `--test` connects to each | `--test` and a connection fails or is locked (exit 3) |
+| `ddl A B [C...]` | Phase 1 comparison, writes `ddl-<id>.html` and `.xlsx` | a difference at or above `--fail-on` (`CRITICAL`, `HIGH` default, `MEDIUM`, `LOW`, `NEVER`) |
+| `data A B [C...]` | Phase 2 comparison, writes `data-<id>.html` and `.xlsx`. `--tables T1,T2`, `--key TABLE=COL1,COL2` | any difference: rows only in some databases, conflicts, key collisions, different row counts, a table in only one database. Tables that could not be compared (no key, too large, error) also fail unless `--allow-uncompared` |
+| `refs A` | undeclared-reference report, writes `refs-<id>.html`. `--check-data [--timeout S] [--max-checks N]` | a candidate at or above `--fail-on` confidence (`HIGH` default, `MEDIUM`, `LOW`, `NEVER`) |
+| `plan --master M S [S...]` | merge **dry run**, writes `merge-<id>.html` and the review `.sql`. `--key`, `--ack TABLE.COLUMN`, `--sequence TABLE=SEQ`, `--orphans fail\|skip`, `--rules FILE` | any blocker (including unresolved conflicts and undeclared references that would break); also warnings with `--fail-on-warnings` |
+
+There is **no command that executes a merge**: review the dry run and execute it from the web UI.
+
+Common options: `--out DIR` (reports, default `reports`), `--json` (JSON summary on stdout), `--store-dir DIR`, `--profile NAME`, `--config FILE`, `--password-env NICK=VAR`.
+
+**Exit codes:** `0` pass · `1` findings at or above the threshold · `2` usage error (bad arguments, unknown or locked connection, missing environment variable) · `3` connection or runtime error.
+
+**Connections and passwords.** Connections are named by nickname: saved in the UI (`~/.dbmerge`, see [Saved connections](#saved-connections)) or preloaded with `--profile local` / `--config FILE`. Passwords are **never** accepted as arguments, since arguments end up in shell history and `ps` output: `--password`, `-p` and `user/password@host` strings are refused without being echoed. For a connection without a saved password, put the password in an environment variable and name it: `--password-env DB_A=DBMERGE_A_PASSWORD`. stdout carries only the summary (or the JSON); Spring's log lines go to stderr.
+
+Example: a nightly drift check in GitHub Actions, with the connections in a config file and the passwords in repository secrets.
+
+```yaml
+- name: Schema drift UAT vs PROD
+  env:
+    UAT_PW:  ${{ secrets.UAT_DB_PASSWORD }}
+    PROD_PW: ${{ secrets.PROD_DB_PASSWORD }}
+  run: |
+    java -jar oracle-db-merge.jar cli ddl UAT PROD --config ci/connections.yml \
+      --password-env UAT=UAT_PW --password-env PROD=PROD_PW \
+      --fail-on HIGH --out drift --json > drift/summary.json
+- uses: actions/upload-artifact@v4
+  if: always()
+  with: { name: drift-report, path: drift/ }
+```
+
+`ci/connections.yml` uses the `dbmerge.preload` format of `config/sample-config.yml`, with `password: ${UAT_PW:}`-style placeholders, or none at all when `--password-env` is used. In a shell script, branch on the code:
+
+```bash
+java -jar oracle-db-merge.jar cli refs CALYPSO_UAT --check-data --fail-on MEDIUM
+case $? in 0) echo clean ;; 1) echo "review refs report" ;; 2) echo "fix the command" ;; *) echo "database problem" ;; esac
+```
+
 ## Passwords
 
 Held in memory as `char[]`, wiped when a connection is removed, masked in every `toString` and never logged. They never appear in reports, scripts, the rules file or logs. Request logging is off and error messages are not echoed.
@@ -160,6 +208,7 @@ Sample schemas live in `src/test/resources/sample/schema_a.sql` (master) and `sc
 ## Layout
 
 ```
+cli/     command-line mode (no web server): argument parsing, exit codes, ddl/data/refs/plan/connections
 conn/    connection registry, encrypted saved connections, read-only / master-only connections
 ddl/     extractor, model, comparator, HTML+Excel report
 data/    row loader, matcher, compare service, HTML+Excel report

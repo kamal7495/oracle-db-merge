@@ -53,7 +53,8 @@ public class AppConfig {
     com.dbmerge.merge.MergeService mergeService(ConnectionRegistry registry, DbMergeProperties props) {
         java.nio.file.Path dir = java.nio.file.Path.of(props.getReportsDir()).toAbsolutePath().normalize();
         return new com.dbmerge.merge.MergeService(registry, props.getMaxRowsPerTable(), dir,
-                new com.dbmerge.merge.RuleStore(dir.resolve("merge-rules.json")));
+                new com.dbmerge.merge.RuleStore(props.getRulesFile() == null || props.getRulesFile().isBlank()
+                        ? dir.resolve("merge-rules.json") : java.nio.file.Path.of(props.getRulesFile())));
     }
 
     @Bean

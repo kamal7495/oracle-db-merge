@@ -18,6 +18,11 @@ public class DbMergeProperties {
     private List<Preload> preload = new ArrayList<>();
     private String storeDir = System.getProperty("user.home") + "/.dbmerge"; // saved connections; blank = saving off
 
+    private String rulesFile = ""; // conflict rules; blank = <reports-dir>/merge-rules.json
+
+    public String getRulesFile() { return rulesFile; }
+    public void setRulesFile(String rulesFile) { this.rulesFile = rulesFile; }
+
     public String getStoreDir() { return storeDir; }
     public void setStoreDir(String storeDir) { this.storeDir = storeDir; }
 
