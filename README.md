@@ -47,7 +47,17 @@ An entry whose variable is empty is skipped (add it in the UI instead).
 
 ## Passwords
 
-Held only in memory as `char[]`, wiped when a connection is removed, masked in every `toString`, never logged and never written to disk (not in reports, scripts, rules file or logs). Request logging is off and error messages are not echoed.
+Held in memory as `char[]`, wiped when a connection is removed, masked in every `toString` and never logged. They never appear in reports, scripts, the rules file or logs. Request logging is off and error messages are not echoed.
+
+### Saved connections
+
+By default a connection lasts until the app stops. Tick **Remember after restart** to save its details, and **Also save the password (encrypted)** to save the password as well.
+
+* Saved to `~/.dbmerge/connections.json` (change with `dbmerge.store-dir`; blank turns saving off). The directory is `700` and the files `600`. The file is written atomically.
+* Passwords are encrypted with **AES-256-GCM**. The key is `DBMERGE_MASTER_KEY` (base64 of 32 random bytes, e.g. `openssl rand -base64 32`) when that variable is set, otherwise `~/.dbmerge/master.key`, generated on first use. A key file readable by group or others is refused, as ssh does.
+* Each ciphertext is bound to its nickname, user, host, port and service. Editing the host in the file to point a saved password at another server makes decryption fail; the password is not sent there.
+* A remembered connection without a saved password, or one whose password cannot be decrypted (different key, edited entry), comes back **locked**. Enter the password in the connection table to unlock it, optionally saving it. Removing a connection deletes its saved copy.
+* **Threat model.** This keeps passwords out of plain text, backups and accidental copies of the JSON file. With the key file beside it, anyone who can read your home directory can decrypt both. Keep the key in `DBMERGE_MASTER_KEY` (from a password manager or keychain), or don't save passwords, when that matters. For production databases prefer not saving passwords at all.
 
 ## Severity model (Phase 1)
 
@@ -150,7 +160,7 @@ Sample schemas live in `src/test/resources/sample/schema_a.sql` (master) and `sc
 ## Layout
 
 ```
-conn/    connection registry, read-only / master-only connections
+conn/    connection registry, encrypted saved connections, read-only / master-only connections
 ddl/     extractor, model, comparator, HTML+Excel report
 data/    row loader, matcher, compare service, HTML+Excel report
 merge/   planner, FK graph, ALTER generator, script renderer, executor, rules, service, report

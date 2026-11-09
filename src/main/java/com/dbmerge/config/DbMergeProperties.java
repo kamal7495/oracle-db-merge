@@ -16,6 +16,10 @@ public class DbMergeProperties {
     private int maxRowsPerTable = 200_000;   // data compare is in-memory; larger tables are counted but not compared
     private int sampleLimit = 1_000;          // detail rows kept per category in data reports (counts stay exact)
     private List<Preload> preload = new ArrayList<>();
+    private String storeDir = System.getProperty("user.home") + "/.dbmerge"; // saved connections; blank = saving off
+
+    public String getStoreDir() { return storeDir; }
+    public void setStoreDir(String storeDir) { this.storeDir = storeDir; }
 
     public int getMaxRowsPerTable() { return maxRowsPerTable; }
     public void setMaxRowsPerTable(int maxRowsPerTable) { this.maxRowsPerTable = maxRowsPerTable; }

@@ -81,6 +81,13 @@ public class ApiController {
         return registry.remove(nickname) ? ResponseEntity.noContent().build() : ResponseEntity.notFound().build();
     }
 
+    public record UnlockRequest(char[] password, Boolean savePassword) { }
+
+    @PostMapping("/connections/{nickname}/unlock")
+    public ConnectionView unlock(@PathVariable String nickname, @RequestBody UnlockRequest request) {
+        return registry.unlock(nickname, request.password(), Boolean.TRUE.equals(request.savePassword()));
+    }
+
     @PostMapping("/connections/{nickname}/test")
     public TestResult test(@PathVariable String nickname) {
         return registry.test(nickname);

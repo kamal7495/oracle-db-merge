@@ -20,6 +20,16 @@ public class AppConfig {
     private static final Logger log = LoggerFactory.getLogger(AppConfig.class);
 
     @Bean
+    ConnectionRegistry connectionRegistry(DbMergeProperties props) {
+        String dir = props.getStoreDir();
+        if (dir == null || dir.isBlank()) return new ConnectionRegistry();
+        ConnectionRegistry r = new ConnectionRegistry(new com.dbmerge.conn.ConnectionStore(java.nio.file.Path.of(dir),
+                System.getenv(com.dbmerge.conn.ConnectionStore.KEY_ENV)));
+        for (String problem : r.loadSaved()) log.warn("Saved connections: {}", problem);
+        return r;
+    }
+
+    @Bean
     SchemaExtractor schemaExtractor(ConnectionRegistry registry) {
         return new SchemaExtractor(registry);
     }

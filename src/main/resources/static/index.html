@@ -28,6 +28,10 @@
   .MEDIUM { background:#fff2b3; color:#5c4400; } .LOW { background:#dff6dd; color:#0f5323; }
   .phases { color:#57606a; font-size:12px; margin-top:4px; }
   td.miss { background:#ffebe9; font-style:italic; }
+  label.inline { display:inline-flex; flex-direction:row; align-items:center; gap:6px; margin-right:16px; font-weight:normal; }
+  label.inline input { width:auto; }
+  .tag { border-radius:10px; padding:1px 7px; font-size:11px; background:#ddf4ff; color:#0a3069; margin-left:6px; }
+  .tag.locked { background:#ffebe9; color:#82071e; }
   .notice { background:#fff8c5; border:1px solid #d4a72c; border-radius:6px; padding:8px 12px; font-size:13px; }
 </style>
 </head>
@@ -46,8 +50,13 @@
       <label>Username<input type="text" name="username" required></label>
       <label>Password<input type="password" name="password" required autocomplete="new-password"></label>
       <label class="span2">Schema to compare (optional, defaults to username)<input type="text" name="schema"></label>
+      <div class="full">
+        <label class="inline"><input type="checkbox" name="save" id="optSave"> Remember after restart</label>
+        <label class="inline"><input type="checkbox" name="savePassword" id="optSavePw"> Also save the password (encrypted)</label>
+      </div>
       <div class="full"><button class="primary" type="submit">Add connection</button>
-        <span class="phases">Passwords are kept in server memory only and are never logged or written to disk.</span></div>
+        <span class="phases">Passwords are never logged. They are written to disk only if you tick "save the password",
+          and then encrypted (AES-256-GCM) in <code>~/.dbmerge/</code>. Remembered connections without a saved password come back locked.</span></div>
     </form>
     <div id="addMsg" class="msg"></div>
     <table id="connTable" style="margin-top:12px">
@@ -157,8 +166,28 @@ async function loadConnections() {
       await api('/api/connections/' + encodeURIComponent(c.nickname), { method: 'DELETE' });
       loadConnections();
     });
+    const name = el('td', { textContent: c.nickname });
+    if (c.saved) name.append(el('span', { className: 'tag', textContent: c.passwordSaved ? 'saved + password' : 'saved' }));
+    if (c.locked) {
+      name.append(el('span', { className: 'tag locked', textContent: 'locked' }));
+      cb.disabled = true;
+      const pw = el('input', { type: 'password', placeholder: 'password', autocomplete: 'current-password' });
+      pw.style.width = '140px';
+      const keep = el('input', { type: 'checkbox' });
+      const unlock = el('button', { textContent: 'Unlock' });
+      unlock.addEventListener('click', async () => {
+        try {
+          await api('/api/connections/' + encodeURIComponent(c.nickname) + '/unlock', { method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password: pw.value, savePassword: keep.checked }) });
+          pw.value = '';
+          loadConnections();
+        } catch (e) { status.className = 'err'; status.textContent = e.message; }
+      });
+      status.append(pw, ' ', el('label', { className: 'inline' }, keep, 'save'), unlock);
+    }
     tbody.append(el('tr', {},
-      el('td', {}, cb), el('td', { textContent: c.nickname }),
+      el('td', {}, cb), name,
       el('td', { textContent: c.host + ':' + c.port + '/' + c.serviceName }),
       el('td', { textContent: c.username + ' / ' + c.schema }),
       status, el('td', {}, test, ' ', del)));
@@ -227,11 +256,16 @@ function renderRefs(r) {
   if (r.truncated) root.append(el('p', { className: 'phases', textContent: 'Showing the first ' + r.candidates.length + '; the report has all findings.' }));
 }
 
+$('#optSavePw').addEventListener('change', () => { if ($('#optSavePw').checked) $('#optSave').checked = true; });
+$('#optSave').addEventListener('change', () => { if (!$('#optSave').checked) $('#optSavePw').checked = false; });
+
 $('#addForm').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const f = ev.target;
   const data = Object.fromEntries(new FormData(f).entries());
   data.port = data.port ? Number(data.port) : null;
+  data.savePassword = f.elements.savePassword.checked;
+  data.save = f.elements.save.checked || data.savePassword;
   $('#addMsg').className = 'msg';
   try {
     await api('/api/connections', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
