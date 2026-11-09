@@ -41,7 +41,7 @@ import org.springframework.web.bind.annotation.RestController;
 @RequestMapping("/api")
 public class ApiController {
 
-    private static final Pattern REPORT_NAME = Pattern.compile("^(ddl|data|merge)-[0-9a-f]{8}(-[a-z]+)?\\.(html|xlsx|sql|txt)$");
+    private static final Pattern REPORT_NAME = Pattern.compile("^(ddl|data|merge|refs)-[0-9a-f]{8}(-[a-z]+)?\\.(html|xlsx|sql|txt)$");
     private static final int MAX_DIFFS_IN_RESPONSE = 500;
 
     private final ConnectionRegistry registry;

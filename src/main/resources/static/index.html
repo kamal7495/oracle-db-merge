@@ -64,6 +64,21 @@
     <div id="result" style="margin-top:14px"></div>
   </section>
 
+  <section>
+    <h2>Undeclared references</h2>
+    <p class="phases">Finds columns that act like foreign keys but have no FOREIGN KEY constraint. The merge cannot rewrite those
+      when a parent row is re-keyed, so check a schema here before merging it. Read-only.</p>
+    <label style="display:inline-flex;flex-direction:row;align-items:center;gap:6px">Connection
+      <select id="refsConn"></select></label>
+    <label style="display:inline-flex;flex-direction:row;align-items:center;gap:6px;margin-left:12px">
+      <input type="checkbox" id="refsData"> Check against the data</label>
+    <button class="primary" id="refsBtn" style="margin-left:12px" disabled>Find references</button>
+    <span id="refsMsg" class="msg"></span>
+    <p class="phases">The data check runs one read-only join query per finding (60 s timeout each, at most 1,000).
+      On a large production schema, run it on a copy or off-hours.</p>
+    <div id="refsResult" style="margin-top:14px"></div>
+  </section>
+
   <section id="dataSection" style="display:none">
     <h2>3. Phase 2 &mdash; compare data</h2>
     <p class="phases">Pick the business key per table (default: primary key). Pick a natural key such as e-mail or SKU when ids were assigned independently in each database. Row data is read-only.</p>
@@ -146,6 +161,67 @@ async function loadConnections() {
       status, el('td', {}, test, ' ', del)));
   }
   updateRunBtn();
+  const sel = $('#refsConn');
+  const prev = sel.value;
+  sel.replaceChildren(...list.map(c => el('option', { value: c.nickname, textContent: c.nickname })));
+  if (list.some(c => c.nickname === prev)) sel.value = prev;
+  $('#refsBtn').disabled = list.length === 0;
+}
+
+$('#refsBtn').addEventListener('click', async () => {
+  const btn = $('#refsBtn');
+  btn.disabled = true;
+  $('#refsMsg').className = 'msg';
+  $('#refsMsg').textContent = $('#refsData').checked ? 'Extracting and checking the data…' : 'Extracting…';
+  $('#refsResult').replaceChildren();
+  try {
+    const r = await api('/api/refs/detect', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nickname: $('#refsConn').value, checkData: $('#refsData').checked }) });
+    $('#refsMsg').textContent = '';
+    renderRefs(r);
+  } catch (e) {
+    $('#refsMsg').textContent = e.message;
+    $('#refsMsg').classList.add('err');
+  } finally { btn.disabled = false; }
+});
+
+function refCheckText(c) {
+  if (!c.dataChecks.length) return '';
+  return c.dataChecks.map(d => {
+    const who = c.dataChecks.length > 1 ? d.parent + ': ' : '';
+    if (d.error) return who + d.error;
+    if (!d.nonNull) return who + 'no values';
+    const pct = (100 * (d.nonNull - d.unresolved) / d.nonNull).toFixed(1);
+    return who + pct + '% of ' + d.nonNull + ' resolve' + (d.unresolved ? ' (' + d.unresolved + ' without parent)' : '');
+  }).join('; ');
+}
+
+function renderRefs(r) {
+  const root = $('#refsResult');
+  const chips = el('p');
+  for (const [c, n] of Object.entries(r.confidenceCounts)) chips.append(el('span', { className: 'badge ' + c, textContent: c + ': ' + n }), ' ');
+  root.append(
+    el('p', {}, el('strong', { textContent: r.candidateCount + ' undeclared reference(s) in ' + r.tables + ' tables; '
+        + r.declaredForeignKeys + ' foreign key(s) declared. ' }),
+      el('a', { href: r.htmlReport, target: '_blank', rel: 'noopener', textContent: 'Open HTML report' })),
+    chips);
+  if (r.warnings.length) root.append(el('p', { className: 'err', textContent: r.warnings.length + ' warning(s) — see report.' }));
+  if (!r.candidates.length) { root.append(el('p', { className: 'good', textContent: 'No undeclared references found.' })); return; }
+  const heads = ['Confidence', 'Kind', 'Column', 'Likely parent', 'Why', ...(r.dataChecked ? ['Data check'] : [])];
+  const table = el('table');
+  table.append(el('thead', {}, el('tr', {}, ...heads.map(h => el('th', { textContent: h })))));
+  const tb = el('tbody');
+  for (const c of r.candidates) {
+    const parent = c.parents.map(p => p + (c.parentColumn ? '.' + c.parentColumn : '')).join(', ');
+    const tr = el('tr', {}, el('td', {}, el('span', { className: 'badge ' + c.confidence, textContent: c.confidence })),
+      el('td', { textContent: c.kind }), el('td', { textContent: c.column + ' ' + c.type }),
+      el('td', { textContent: parent }), el('td', { textContent: c.rule }));
+    if (r.dataChecked) tr.append(el('td', { textContent: refCheckText(c) }));
+    tb.append(tr);
+  }
+  table.append(tb);
+  root.append(table);
+  if (r.truncated) root.append(el('p', { className: 'phases', textContent: 'Showing the first ' + r.candidates.length + '; the report has all findings.' }));
 }
 
 $('#addForm').addEventListener('submit', async (ev) => {

@@ -5,9 +5,10 @@ Compare and merge **N Oracle databases into one master**. Java 17, Maven, `ojdbc
 * **Phase 1** – extract DDL from every database, compare all of them against each other, classify each difference by severity, report as HTML and Excel.
 * **Phase 2** – per-table row counts, matches and conflicts on a business key you choose (default: primary key), report as HTML and Excel.
 * **Phase 3** – merge the others into the master you choose: dependency-ordered, collision-safe, dry-run by default, one transaction, validated before commit.
+* **Undeclared references** – for one schema, list the columns that act like foreign keys but have no FOREIGN KEY constraint, optionally checked against the data. Run this before merging a schema whose integrity lives in the application (typical of vendor packages such as trading systems).
 
 > **Status of this build – read this first.**
-> `mvn verify` passes: the unit tests plus the Testcontainers integration tests against Oracle Free 23 (`SchemaExtractorIT`, `MergeIT`, `LobMergeIT`). These cover extraction, the Phase 2 comparison, planning, executing, rolling back and validating merges, including BLOB/CLOB columns.
+> `mvn verify` passes: the unit tests plus the Testcontainers integration tests against Oracle Free 23 (`SchemaExtractorIT`, `MergeIT`, `LobMergeIT`, `ReferenceIT`). These cover extraction, the Phase 2 comparison, planning, executing, rolling back and validating merges (including BLOB/CLOB columns), and the undeclared-reference detection with its data check.
 > **Not covered by any test:** the REST controllers, the web UI and the Excel report writers. The server starts and serves the UI, but these have not been exercised end to end.
 > **Do not point the executor at a real master before a dry run on a copy and a Data Pump backup.**
 
@@ -65,6 +66,27 @@ Constraints and indexes are matched by structure (columns, type, referenced tabl
 * Rows are compared in memory. Tables above `dbmerge.max-rows-per-table` (default 200 000) are counted but not compared.
 * Report sections: only in one DB, identical in several, different in several (column-level diffs), PK collisions.
 
+## Undeclared references
+
+The merge rewrites a child's reference to a re-keyed parent **only through declared foreign keys**. Many application schemas enforce their relationships in code instead, and in those a re-keyed parent leaves its children pointing at the old key: the wrong row, or nothing. This report finds those columns. It is read-only and works on one connection at a time (UI section *Undeclared references*, or `POST /api/refs/detect` with `{"nickname": "...", "checkData": true}`); the result is written to `reports/refs-<id>.html`.
+
+Columns covered by a declared foreign key are skipped, as are types that cannot hold keys (dates, LOBs, decimals). The first rule that matches a column wins:
+
+| Finding | Example | Confidence |
+|---|---|---|
+| Same name as another table's single-column primary key | `TRADE_KEYWORD.TRADE_ID` → `TRADE` | HIGH (MEDIUM when several tables have that key) |
+| Table name + ID suffix (`_ID`, `_NB`, `_NO`, `_NUM`, `_KEY`, `_REF`, `_CODE`, `ID`) | `CUSTOMER_ID` → `CUSTOMER`; plural tables: `ORDER_ID` → `ORDERS` | HIGH; MEDIUM for plurals |
+| Role prefix in front of a key or table name, including self-references | `PARENT_TRADE_ID` → `TRADE` | MEDIUM |
+| Shared primary key (1:1 extension table) | `PRODUCT_BOND.PRODUCT_ID` ↔ `PRODUCT_DESC` | MEDIUM; the direction is not guessed |
+| Type + ID pair: points at a different table per row and can never be a foreign key | `OBJECT_ID` + `OBJECT_CLASS` | separate section |
+| Named like an ID, but no table matches | `CPTY_ID` | LOW |
+
+Generic key names (`ID`, `CODE`, `NAME`, `M_IDENTITY`, …) are never matched by name alone, or every table would link to every other. A child whose type family differs from the parent key (text vs number) drops one confidence level and says why.
+
+**Data check** (optional): for each likely parent, one `LEFT JOIN` query counts the child's non-null values and how many have no parent row, with up to three example values. Each query has a timeout (default 60 s) and runs in a fresh `READ ONLY` transaction, and at most 1 000 queries run (`timeoutSeconds` / `maxChecks` in the request). For ambiguous and shared-key findings every parent is checked, which shows which one really holds the values. On a large production schema run it on a copy or off-hours.
+
+Limits: detection works from names, so it misses references whose names do not match their table, IDs held inside BLOBs or XML, and references to other schemas or systems. Vendor naming such as Murex's `M_` columns mostly lands in the *no matching table* section. The data check counts values; a 100 % match makes a reference likely, it does not prove it.
+
 ## Phase 3 – how the merge works
 
 1. **Plan (dry run, always first).** Reads master and sources read-only. Produces `merge-<id>.html` (preview), `merge-<id>.sql` (full review script) and the plan shown in the UI. Nothing is changed.
@@ -108,8 +130,8 @@ Constraints and indexes are matched by structure (columns, type, referenced tabl
 ## Tests
 
 ```bash
-mvn test      # unit tests (no database): comparator, registry, row matcher, FK graph, planner, script/alter generators, report writers
-mvn verify    # also the Testcontainers integration tests (needs Docker): SchemaExtractorIT, MergeIT, LobMergeIT
+mvn test      # unit tests (no database): comparator, registry, row matcher, FK graph, planner, script/alter generators, report writers, reference detector
+mvn verify    # also the Testcontainers integration tests (needs Docker): SchemaExtractorIT, MergeIT, LobMergeIT, ReferenceIT
 ```
 
 The integration tests are skipped, not failed, when Testcontainers finds no Docker, so check the output says `Skipped: 0`. With Colima instead of Docker Desktop:
@@ -120,7 +142,7 @@ export TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock
 mvn verify
 ```
 
-`LobMergeIT` builds its own `DOC`/`DOC_NOTE` tables (CLOB + BLOB) in code instead of using the sample scripts.
+`LobMergeIT` builds its own `DOC`/`DOC_NOTE` tables (CLOB + BLOB) in code instead of using the sample scripts. `ReferenceIT` builds a small trading-style schema with **no** declared foreign keys and deliberately imperfect data (an orphan, a 1:1 product table, an ambiguous reference, a text column pointing at a number key).
 
 Sample schemas live in `src/test/resources/sample/schema_a.sql` (master) and `schema_b.sql` (source): FK chain `REGION ← CUSTOMER ← ORDERS ← ORDER_ITEM → PRODUCT`, PK collisions (customer 1 is Alice in A, Carol in B), identical duplicates (Bob, Widget), same person with different PK (Alice 1 vs 3), a table only in B (`AUDIT_NOTE`), a wider `EMAIL`, a different `QTY` type, an extra column, a missing index/trigger, and an order status that violates A's check constraint (used to prove rollback).
 
@@ -131,5 +153,6 @@ conn/    connection registry, read-only / master-only connections
 ddl/     extractor, model, comparator, HTML+Excel report
 data/    row loader, matcher, compare service, HTML+Excel report
 merge/   planner, FK graph, ALTER generator, script renderer, executor, rules, service, report
+refs/    undeclared-reference detector, data check, HTML report
 web/     REST controllers; static/index.html is the UI
 ```

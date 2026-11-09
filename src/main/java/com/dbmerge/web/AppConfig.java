@@ -47,6 +47,16 @@ public class AppConfig {
     }
 
     @Bean
+    com.dbmerge.refs.ReferenceService referenceService(ConnectionRegistry registry, SchemaExtractor extractor) {
+        return new com.dbmerge.refs.ReferenceService(registry, extractor);
+    }
+
+    @Bean
+    com.dbmerge.refs.ReferenceHtmlReportWriter referenceHtmlReportWriter() {
+        return new com.dbmerge.refs.ReferenceHtmlReportWriter();
+    }
+
+    @Bean
     SchemaComparator schemaComparator() {
         return new SchemaComparator();
     }
