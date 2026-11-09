@@ -96,6 +96,9 @@
       <label style="display:inline-flex;flex-direction:row;gap:6px;align-items:center;margin-left:16px"><input type="checkbox" id="optTriggers"> disable master triggers during load (re-enabled afterwards)</label>
       <label style="display:inline-flex;flex-direction:row;gap:6px;align-items:center;margin-left:16px">orphan rows:
         <select id="optOrphan"><option value="FAIL">block the merge</option><option value="SKIP">skip them</option></select></label></p>
+    <p><label style="display:flex;flex-direction:column;gap:3px;max-width:640px">Columns confirmed NOT to be references
+        (TABLE.COLUMN, comma-separated). Only for false alarms from the undeclared-reference check: it turns that blocker into a warning.
+        <input type="text" id="optAck" placeholder="e.g. BO_MESSAGE.LINKED_ID"></label></p>
     <p><button class="primary" id="planBtn">Dry run (change nothing)</button> <span id="planMsg" class="msg"></span></p>
     <div id="planResult"></div>
     <div id="execBox" style="display:none;border-top:1px solid var(--b);margin-top:14px;padding-top:12px">
@@ -385,7 +388,8 @@ $('#planBtn').addEventListener('click', async () => {
   try {
     const p = await api('/api/merge/plan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
       ddlId: currentDdlId, master, sources: lastDbs.filter(d => d !== master), keys: collectKeys(),
-      disableTriggers: $('#optTriggers').checked, orphanPolicy: $('#optOrphan').value }) });
+      disableTriggers: $('#optTriggers').checked, orphanPolicy: $('#optOrphan').value,
+      acknowledgedReferences: $('#optAck').value.split(',').map(s => s.trim()).filter(Boolean) }) });
     $('#planMsg').textContent = '';
     currentPlan = p;
     renderPlan(p);

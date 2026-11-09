@@ -65,9 +65,32 @@ public final class MergeModel {
     /** Schema change proposed for the master. DDL is auto-committed by Oracle, so each needs explicit approval. */
     public record AlterStatement(String id, AlterKind kind, String table, String sql, String reason, boolean requiredByPlan) { }
 
-    public record Options(boolean disableTriggers, OrphanPolicy orphanPolicy, Map<String, String> pkSequences) {
+    /**
+     * @param acknowledgedReferences "TABLE.COLUMN" entries the user confirmed are NOT references, so an undeclared-reference
+     *                               blocker on them becomes a warning (see {@link UndeclaredReferenceGuard})
+     */
+    public record Options(boolean disableTriggers, OrphanPolicy orphanPolicy, Map<String, String> pkSequences,
+                          java.util.Set<String> acknowledgedReferences) {
+
+        public Options {
+            pkSequences = pkSequences == null ? Map.of() : Map.copyOf(pkSequences);
+            acknowledgedReferences = acknowledgedReferences == null ? java.util.Set.of()
+                    : java.util.Set.copyOf(acknowledgedReferences.stream().map(s -> s.trim().toUpperCase(java.util.Locale.ROOT))
+                            .filter(s -> !s.isEmpty()).toList());
+        }
+
+        public Options(boolean disableTriggers, OrphanPolicy orphanPolicy, Map<String, String> pkSequences) {
+            this(disableTriggers, orphanPolicy, pkSequences, java.util.Set.of());
+        }
+
         public static Options defaults() {
             return new Options(false, OrphanPolicy.FAIL, Map.of());
+        }
+
+        @Override
+        public String toString() {   // part of the plan fingerprint: keep it deterministic
+            return "Options[disableTriggers=" + disableTriggers + ", orphanPolicy=" + orphanPolicy + ", pkSequences="
+                    + new java.util.TreeMap<>(pkSequences) + ", acknowledgedReferences=" + new java.util.TreeSet<>(acknowledgedReferences) + "]";
         }
     }
 

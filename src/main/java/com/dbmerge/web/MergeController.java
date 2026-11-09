@@ -40,7 +40,8 @@ public class MergeController {
     }
 
     public record PlanRequest(String ddlId, String master, List<String> sources, Map<String, List<String>> keys,
-                              Boolean disableTriggers, String orphanPolicy, Map<String, String> pkSequences) { }
+                              Boolean disableTriggers, String orphanPolicy, Map<String, String> pkSequences,
+                              List<String> acknowledgedReferences) { }
 
     public record ExecuteRequest(String planId, String confirmation, boolean backupConfirmed, List<String> approvedAlters) { }
 
@@ -54,7 +55,8 @@ public class MergeController {
         ComparisonResult ddl = store.get(req.ddlId()).orElseThrow(() -> new IllegalArgumentException("Unknown DDL comparison: " + req.ddlId()));
         Options options = new Options(Boolean.TRUE.equals(req.disableTriggers()),
                 req.orphanPolicy() == null ? OrphanPolicy.FAIL : OrphanPolicy.valueOf(req.orphanPolicy().toUpperCase()),
-                req.pkSequences() == null ? Map.of() : req.pkSequences());
+                req.pkSequences() == null ? Map.of() : req.pkSequences(),
+                req.acknowledgedReferences() == null ? java.util.Set.of() : new java.util.HashSet<>(req.acknowledgedReferences()));
         MergePlan p = service.plan(ddl, req.master(), req.sources() == null ? List.of() : req.sources(), req.keys(), options);
         return summary(p);
     }

@@ -123,6 +123,8 @@ public class MergePlanner {
                     idMap, pkSets, tablesWithSourceRows, issues);
             steps.add(step);
         }
+        // Needs the finished plan: it compares copied child values with the parents' changed keys.
+        UndeclaredReferenceGuard.check(eff, steps, options.acknowledgedReferences(), issues);
 
         Map<String, List<String>> triggers = new TreeMap<>();
         if (options.disableTriggers()) {

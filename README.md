@@ -68,7 +68,7 @@ Constraints and indexes are matched by structure (columns, type, referenced tabl
 
 ## Undeclared references
 
-The merge rewrites a child's reference to a re-keyed parent **only through declared foreign keys**. Many application schemas enforce their relationships in code instead, and in those a re-keyed parent leaves its children pointing at the old key: the wrong row, or nothing. This report finds those columns. It is read-only and works on one connection at a time (UI section *Undeclared references*, or `POST /api/refs/detect` with `{"nickname": "...", "checkData": true}`); the result is written to `reports/refs-<id>.html`.
+The merge rewrites a child's reference to a re-keyed parent **only through declared foreign keys**. Many application schemas enforce their relationships in code instead, and in those a re-keyed parent leaves its children pointing at the old key: the wrong row, or nothing. This report finds those columns. It is read-only and works on one connection at a time (UI section *Undeclared references*, or `POST /api/refs/detect` with `{"nickname": "...", "checkData": true}`); the result is written to `reports/refs-<id>.html`. The same rules also run inside every Phase 3 plan, where they block a merge that would actually break one of these references (see *Safety model*).
 
 Columns covered by a declared foreign key are skipped, as are types that cannot hold keys (dates, LOBs, decimals). The first rule that matches a column wins:
 
@@ -106,6 +106,7 @@ Limits: detection works from names, so it misses references whose names do not m
 * Dry run is the default and the only thing `/api/merge/plan` does.
 * Execution needs: a plan with **no blockers**, "I took a Data Pump backup" ticked, the exact phrase `MERGE INTO <master>` typed, and approval of every *required* schema change.
 * **Only the master is ever opened for writing**; sources use `SET TRANSACTION READ ONLY` connections. The master cannot also be a source.
+* **Undeclared references block the plan.** After planning, every likely reference from the [undeclared-reference](#undeclared-references) rules is checked against the planned rows. If a row being copied holds the *old* key of a parent row whose key changes in this merge (re-keyed, or matched to a master row with another key), the plan gets a BLOCKER naming the column and example rows, since the copied value would point at the wrong row. The check uses the actual planned values, so a schema full of undeclared references only blocks when a referenced key really changes. To continue: declare the foreign key on the master (the merge then rewrites it), leave the child table out, or, for a false alarm, list `TABLE.COLUMN` under *Columns confirmed NOT to be references* (`acknowledgedReferences` in the plan request), which turns that blocker into a warning. Type + ID pairs cannot be checked and produce a warning whenever keys change.
 * Before writing, master row counts must equal those seen at plan time, otherwise the run is refused and you plan again.
 * **All row changes run in one transaction**, then validated *before* commit: row counts (master = old master + inserted rows; source rows − duplicates/skips are shown), no new orphan FK rows, sample comparison of inserted rows against the source values. Any error or failed check → `ROLLBACK`.
 * Triggers: optionally disabled on the master for the load and **always re-enabled** in a `finally` block (a failure to re-enable is logged loudly). Constraints are never disabled – loading in FK order makes that unnecessary.
@@ -142,7 +143,7 @@ export TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock
 mvn verify
 ```
 
-`LobMergeIT` builds its own `DOC`/`DOC_NOTE` tables (CLOB + BLOB) in code instead of using the sample scripts. `ReferenceIT` builds a small trading-style schema with **no** declared foreign keys and deliberately imperfect data (an orphan, a 1:1 product table, an ambiguous reference, a text column pointing at a number key).
+`LobMergeIT` builds its own `DOC`/`DOC_NOTE` tables (CLOB + BLOB) in code instead of using the sample scripts. `ReferenceIT` builds a small trading-style schema with **no** declared foreign keys and deliberately imperfect data (an orphan, a 1:1 product table, an ambiguous reference, a text column pointing at a number key), plus a second install whose re-keyed legal entity must make the merge refuse to run.
 
 Sample schemas live in `src/test/resources/sample/schema_a.sql` (master) and `schema_b.sql` (source): FK chain `REGION ← CUSTOMER ← ORDERS ← ORDER_ITEM → PRODUCT`, PK collisions (customer 1 is Alice in A, Carol in B), identical duplicates (Bob, Widget), same person with different PK (Alice 1 vs 3), a table only in B (`AUDIT_NOTE`), a wider `EMAIL`, a different `QTY` type, an extra column, a missing index/trigger, and an order status that violates A's check constraint (used to prove rollback).
 

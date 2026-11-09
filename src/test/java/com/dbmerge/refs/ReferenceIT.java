@@ -18,6 +18,7 @@ import java.sql.DriverManager;
 import java.sql.Statement;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.BeforeAll;
@@ -80,9 +81,58 @@ class ReferenceIT {
                 s.execute(sql);
             }
         }
+        // A second install: its legal entity 1 is a different entity (collides with the master's 1, so it is re-keyed),
+        // and its book refers to it through an undeclared LEGAL_ENTITY_ID.
+        try (Connection sys = DriverManager.getConnection(url(), "system", ORACLE.getPassword()); Statement s = sys.createStatement()) {
+            s.execute("CREATE USER TRADING_B IDENTIFIED BY \"" + USER_PW + "\"");
+            s.execute("GRANT CREATE SESSION, CREATE TABLE, UNLIMITED TABLESPACE TO TRADING_B");
+        }
+        try (Connection c = DriverManager.getConnection(url(), "TRADING_B", USER_PW); Statement s = c.createStatement()) {
+            for (String sql : List.of(
+                    "CREATE TABLE legal_entity (legal_entity_id NUMBER(10) PRIMARY KEY, short_name VARCHAR2(64) NOT NULL)",
+                    "CREATE TABLE book (book_id NUMBER(10) PRIMARY KEY, legal_entity_id NUMBER(10) NOT NULL, book_name VARCHAR2(64))",
+                    "INSERT INTO legal_entity VALUES (1, 'PO_NEWYORK')",
+                    "INSERT INTO book VALUES (20, 1, 'FX_NY')",
+                    "COMMIT")) {
+                s.execute(sql);
+            }
+        }
         registry = new ConnectionRegistry();
         registry.add(new ConnectionRequest("TRD", ORACLE.getHost(), ORACLE.getOraclePort(), ORACLE.getDatabaseName(), "TRADING",
                 USER_PW.toCharArray(), null));
+        registry.add(new ConnectionRequest("TRD_B", ORACLE.getHost(), ORACLE.getOraclePort(), ORACLE.getDatabaseName(), "TRADING_B",
+                USER_PW.toCharArray(), null));
+    }
+
+    @Test
+    void mergeIsRefusedWhenItWouldBreakAnUndeclaredReference() throws Exception {
+        SchemaExtractor ex = new SchemaExtractor(registry);
+        Map<String, com.dbmerge.ddl.model.SchemaModel> models = new java.util.LinkedHashMap<>();
+        models.put("TRD", ex.extract("TRD", false));
+        models.put("TRD_B", ex.extract("TRD_B", false));
+        var plan = new com.dbmerge.merge.MergePlanner(new com.dbmerge.merge.JdbcMergeData(registry, 100_000)).plan("TRD", List.of("TRD_B"),
+                models, Map.of("LEGAL_ENTITY", List.of("SHORT_NAME"), "BOOK", List.of("BOOK_NAME")), new com.dbmerge.merge.Rules(),
+                com.dbmerge.merge.MergeModel.Options.defaults());
+
+        var blockers = plan.issues().stream().filter(i -> i.level() == com.dbmerge.merge.MergeModel.Level.BLOCKER).toList();
+        assertEquals(1, blockers.size(), plan.issues().toString());
+        assertTrue(blockers.get(0).message().contains("BOOK.LEGAL_ENTITY_ID") && blockers.get(0).message().contains("LEGAL_ENTITY_ID=1"),
+                blockers.get(0).message());
+
+        var result = new com.dbmerge.merge.MergeExecutor(registry).execute(plan, Set.of());
+        assertEquals(com.dbmerge.merge.MergeModel.RunStatus.REFUSED, result.status());
+        try (Connection c = DriverManager.getConnection(url(), "TRADING", USER_PW); Statement s = c.createStatement();
+             var rs = s.executeQuery("SELECT (SELECT COUNT(*) FROM book), (SELECT COUNT(*) FROM legal_entity) FROM dual")) {
+            rs.next();
+            assertEquals(1, rs.getInt(1), "master books unchanged");
+            assertEquals(1, rs.getInt(2), "master legal entities unchanged");
+        }
+
+        // Acknowledged as not a reference: the blocker becomes a warning (the user takes responsibility).
+        var acked = new com.dbmerge.merge.MergePlanner(new com.dbmerge.merge.JdbcMergeData(registry, 100_000)).plan("TRD", List.of("TRD_B"),
+                models, Map.of("LEGAL_ENTITY", List.of("SHORT_NAME"), "BOOK", List.of("BOOK_NAME")), new com.dbmerge.merge.Rules(),
+                new com.dbmerge.merge.MergeModel.Options(false, com.dbmerge.merge.MergeModel.OrphanPolicy.FAIL, Map.of(), Set.of("BOOK.LEGAL_ENTITY_ID")));
+        assertFalse(acked.hasBlockers(), acked.issues().toString());
     }
 
     static ReferenceService service() {
