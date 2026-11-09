@@ -391,7 +391,9 @@ function renderData(r) {
       el('td', { textContent: compared ? t.identical : '' }),
       el('td', { textContent: compared ? t.conflicts : '' }),
       el('td', { textContent: compared ? t.pkCollisions : '' }),
-      el('td', { textContent: compared ? (t.warnings.length ? 'compared, ' + t.warnings.length + ' warning(s)' : 'compared') : t.status + ': ' + (t.message || '') })));
+      el('td', { title: compared && t.message ? t.message : '',
+        textContent: compared ? (t.message ? 'compared by hash' : 'compared') + (t.warnings.length ? ', ' + t.warnings.length + ' warning(s)' : '')
+          : t.status + ': ' + (t.message || '') })));
   }
   table.append(tb);
   root.append(table);

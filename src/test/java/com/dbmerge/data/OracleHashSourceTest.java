@@ -1,0 +1,79 @@
+package com.dbmerge.data;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import com.dbmerge.ddl.model.ColumnDef;
+import com.dbmerge.ddl.model.TableDef;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import org.junit.jupiter.api.Test;
+
+class OracleHashSourceTest {
+
+    private static ColumnDef col(String name, String type) {
+        return new ColumnDef(name, 1, type, 30, null, null, "B", true, null, false, false);
+    }
+
+    @Test
+    void piecesUseNlsIndependentFormatsAndMarkNulls() {
+        assertTrue(OracleHashSource.piece(col("AMT", "NUMBER"), false, false).contains("'TM9', 'NLS_NUMERIC_CHARACTERS=''.,'''"));
+        assertTrue(OracleHashSource.piece(col("D", "DATE"), false, false).contains("'SYYYY-MM-DD HH24:MI:SS'"));
+        assertTrue(OracleHashSource.piece(col("TS", "TIMESTAMP(6) WITH TIME ZONE"), false, false).contains("SYS_EXTRACT_UTC"));
+        String text = OracleHashSource.piece(col("NAME", "VARCHAR2"), false, false);
+        assertTrue(text.startsWith("CASE WHEN t.\"NAME\" IS NULL THEN 'N'"), text);
+        assertTrue(OracleHashSource.piece(col("NAME", "VARCHAR2"), false, true).contains("UTL_I18N.STRING_TO_RAW"));
+    }
+
+    @Test
+    void lobsNeedDbmsCryptoAndSomeTypesAreNeverHashed() {
+        assertNull(OracleHashSource.piece(col("DOC", "CLOB"), false, false));
+        String lob = OracleHashSource.piece(col("DOC", "BLOB"), true, false);
+        assertTrue(lob.contains("DBMS_CRYPTO.HASH") && lob.contains("THEN 'E'"), lob);
+        for (String t : List.of("LONG", "LONG RAW", "XMLTYPE", "BFILE", "UROWID", "SDO_GEOMETRY")) {
+            assertNull(OracleHashSource.piece(col("X", t), true, false), t);
+        }
+        assertTrue(OracleHashSource.isLong(col("X", "LONG RAW")));
+    }
+
+    @Test
+    void identifiersAreQuoted() {
+        String p = OracleHashSource.piece(col("we\"ird", "VARCHAR2"), false, false);
+        assertTrue(p.contains("t.\"we\"\"ird\""), p);
+    }
+
+    @Test
+    void manyColumnsAreHashedInGroupsBelowTheVarcharLimit() {
+        List<String> pieces = new ArrayList<>();
+        for (int i = 0; i < 250; i++) pieces.add("P" + i);
+        String sql = OracleHashSource.combine(pieces);
+        assertEquals(4, sql.split("STANDARD_HASH", -1).length - 1, "three groups of up to 100, then one over the groups");
+        assertEquals("'0'", OracleHashSource.combine(List.of()));
+        assertEquals("RAWTOHEX(STANDARD_HASH(P1, 'MD5'))", OracleHashSource.combine(List.of("P1")));
+    }
+
+    @Test
+    void generatedQueriesFilterBucketsAndBindOnlyKeyHashes() {
+        Map<String, ColumnDef> cols = new LinkedHashMap<>();
+        cols.put("ID", col("ID", "NUMBER"));
+        cols.put("NAME", col("NAME", "VARCHAR2"));
+        cols.put("NOTES", col("NOTES", "LONG"));
+        TableDef def = new TableDef("T", cols, List.of(), List.of(), List.of());
+        OracleHashSource s = new OracleHashSource(Map.of(), Map.of("A", "OWNER"), Map.of("A", def), "T", List.of("ID"),
+                List.of(), List.of("ID", "NAME"), List.of("ID", "NAME"), new OracleHashSource.Options(false, false, 60));
+
+        String agg = s.keyBucketsSql("A", 50);
+        assertTrue(agg.contains("ORA_HASH(DBM$KH, 49)") && agg.contains("FROM \"OWNER\".\"T\" t") && agg.contains("GROUP BY DBM$B"), agg);
+        String rows = s.rowsSql("A", "DBM$KH", 50, List.of(3, 9));
+        assertTrue(rows.endsWith("WHERE ORA_HASH(x.DBM$KH, 49) IN (3, 9) ORDER BY 1"), rows);
+        List<Integer> many = new ArrayList<>();
+        for (int i = 0; i < 1001; i++) many.add(i);
+        assertFalse(s.rowsSql("A", "DBM$KH", 2000, many).contains("WHERE"), "long bucket lists are skipped in Java instead");
+        String sample = s.sampleSql("A", 3);
+        assertTrue(sample.endsWith("IN (?, ?, ?)") && !sample.contains("NOTES"), sample);
+    }
+}

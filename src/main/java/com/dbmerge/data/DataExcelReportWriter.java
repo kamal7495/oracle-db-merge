@@ -69,7 +69,8 @@ public class DataExcelReportWriter {
                     num(x, c++, t.conflictCount(), t.conflictCount() > 0 ? warn : plain);
                     num(x, c++, t.pkCollisionCount(), t.pkCollisionCount() > 0 ? warn : plain);
                     num(x, c++, t.pkDivergenceCount(), plain);
-                    cell(x, c, t.warnings().isEmpty() ? "compared" : "compared; " + t.warnings().size() + " warning(s)", plain);
+                    cell(x, c, (t.message() != null ? "compared by hash" : "compared")
+                            + (t.warnings().isEmpty() ? "" : "; " + t.warnings().size() + " warning(s)"), plain);
                 } else {
                     for (int i = 0; i < 5; i++) cell(x, c++, "", plain);
                     cell(x, c, t.status() + ": " + t.message(), plain);
@@ -180,6 +181,11 @@ public class DataExcelReportWriter {
             header(w, 0, head, "Table", "Warning");
             row = 1;
             for (TableDataResult t : r.tables()) {
+                if (t.status() == Status.COMPARED && t.message() != null) {
+                    Row y = w.createRow(row++);
+                    cell(y, 0, t.table(), plain);
+                    cell(y, 1, "Note: " + t.message(), plain);
+                }
                 for (String text : t.warnings()) {
                     Row y = w.createRow(row++);
                     cell(y, 0, t.table(), plain);

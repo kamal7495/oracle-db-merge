@@ -28,35 +28,40 @@ public final class RowLoader {
     public static List<Map<String, String>> load(Connection c, String owner, String table,
                                                   List<String> columns, int maxRows) throws SQLException {
         String sql = "SELECT " + Sql.columnList(columns) + " FROM " + Sql.qualified(owner, table);
-        List<Map<String, String>> rows = new ArrayList<>();
         try (Statement s = c.createStatement()) {
             s.setFetchSize(500);
             try (ResultSet rs = s.executeQuery(sql)) {
-                ResultSetMetaData md = rs.getMetaData();
-                int n = md.getColumnCount();
-                boolean[] binary = new boolean[n];
-                for (int i = 0; i < n; i++) {
-                    int t = md.getColumnType(i + 1);
-                    binary[i] = t == Types.BLOB || t == Types.BINARY || t == Types.VARBINARY || t == Types.LONGVARBINARY;
-                }
-                while (rs.next()) {
-                    if (rows.size() >= maxRows) {
-                        throw new IllegalStateException("Table " + table + " has more than " + maxRows + " rows.");
-                    }
-                    Map<String, String> row = new LinkedHashMap<>();
-                    for (int i = 0; i < n; i++) {   // read strictly left to right (LONG columns require it)
-                        String v;
-                        if (binary[i]) {
-                            byte[] b = rs.getBytes(i + 1);
-                            v = b == null ? null : HexFormat.of().formatHex(b);
-                        } else {
-                            v = rs.getString(i + 1);
-                        }
-                        row.put(columns.get(i), v);
-                    }
-                    rows.add(row);
-                }
+                return read(rs, columns, maxRows, table);
             }
+        }
+    }
+
+    /** Reads every row of {@code rs}; result-set column i is stored under {@code columns.get(i)}. */
+    static List<Map<String, String>> read(ResultSet rs, List<String> columns, int maxRows, String table) throws SQLException {
+        List<Map<String, String>> rows = new ArrayList<>();
+        ResultSetMetaData md = rs.getMetaData();
+        int n = md.getColumnCount();
+        boolean[] binary = new boolean[n];
+        for (int i = 0; i < n; i++) {
+            int t = md.getColumnType(i + 1);
+            binary[i] = t == Types.BLOB || t == Types.BINARY || t == Types.VARBINARY || t == Types.LONGVARBINARY;
+        }
+        while (rs.next()) {
+            if (rows.size() >= maxRows) {
+                throw new IllegalStateException("Table " + table + " has more than " + maxRows + " rows.");
+            }
+            Map<String, String> row = new LinkedHashMap<>();
+            for (int i = 0; i < n; i++) {   // read strictly left to right (LONG columns require it)
+                String v;
+                if (binary[i]) {
+                    byte[] b = rs.getBytes(i + 1);
+                    v = b == null ? null : HexFormat.of().formatHex(b);
+                } else {
+                    v = rs.getString(i + 1);
+                }
+                row.put(columns.get(i), v);
+            }
+            rows.add(row);
         }
         return rows;
     }
