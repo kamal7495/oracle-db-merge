@@ -262,10 +262,11 @@ public class MergeExecutor {
                                       SequencePool sequences, long[] remapsLeft) throws SQLException {
         switch (r.action()) {
             case INSERT, INSERT_REMAPPED -> {
-                Map<String, Object> vals = resolve(r.values(), keyMap);
+                Map<String, Object> vals = resolve(r.values(), keyMap, r, step);
                 boolean seq = r.action() == RowAction.INSERT_REMAPPED && step.pkMode() == PkMode.SEQUENCE;
                 String pkCol = step.pkColumns().size() == 1 ? step.pkColumns().get(0) : null;
                 if (seq) vals.put(pkCol, sequences.next(c, schema, step.sequence(), remapsLeft[0]--));
+                pointAtItself(r, step, vals, vals);
                 List<String> cols = new ArrayList<>(vals.keySet());
                 List<String> placeholders = new ArrayList<>();
                 for (String col : cols) placeholders.add(placeholder(def, col, vals.get(col)));
@@ -293,7 +294,8 @@ public class MergeExecutor {
                 return pk;
             }
             case UPDATE -> {
-                Map<String, Object> vals = resolve(r.values(), keyMap);
+                Map<String, Object> vals = resolve(r.values(), keyMap, r, step);
+                pointAtItself(r, step, vals, pkOf(step, r));
                 List<String> cols = new ArrayList<>(vals.keySet());
                 StringBuilder sql = new StringBuilder("UPDATE " + qualified(schema, step.table()) + " SET ");
                 for (int i = 0; i < cols.size(); i++) {
@@ -324,10 +326,29 @@ public class MergeExecutor {
         return m;
     }
 
-    private static Map<String, Object> resolve(Map<String, Object> values, KeyMap keyMap) {
+    /** A row that references itself gets its own (final) key: resolved here, after the key is known. */
+    private static void pointAtItself(PlannedRow r, TableStep step, Map<String, Object> vals, Map<String, Object> ownKey) {
+        for (var e : vals.entrySet()) {
+            if (e.getValue() instanceof FkRef f && isSelf(f, r, step)) {
+                Object v = ownKey == null ? null : ownKey.get(f.parentColumn());
+                if (v == null) throw new IllegalStateException("Own key not known for " + step.table() + " " + r.businessKey());
+                e.setValue(v);
+            }
+        }
+    }
+
+    private static boolean isSelf(FkRef f, PlannedRow r, TableStep step) {
+        return f.parentTable().equals(step.table()) && f.sourceDb().equals(r.sourceDb()) && f.oldKey().equals(r.oldKey());
+    }
+
+    private static Map<String, Object> resolve(Map<String, Object> values, KeyMap keyMap, PlannedRow row, TableStep step) {
         Map<String, Object> out = new LinkedHashMap<>();
         for (var e : values.entrySet()) {
             Object v = e.getValue();
+            if (v instanceof FkRef f && isSelf(f, row, step)) {
+                out.put(e.getKey(), v); // the row's own key: set by pointAtItself once it is known
+                continue;
+            }
             if (v instanceof FkRef f) {
                 Map<String, Object> target = keyMap.get(f.sourceDb(), f.parentTable(), f.oldKey());
                 if (target == null || !target.containsKey(f.parentColumn()) || target.get(f.parentColumn()) == null) {

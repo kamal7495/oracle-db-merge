@@ -49,6 +49,14 @@ final class KeyMap {
         }
     }
 
+    /** Forgets (source, table, oldKey): the row turned out not to be merged (an orphan). */
+    void remove(String source, String table, String oldKey) {
+        Group g = groups.get(source + "|" + table);
+        if (g == null) return;
+        g.identity.remove(oldKey);
+        g.explicit.remove(oldKey);
+    }
+
     /** The master primary key for (source, table, oldKey), or null when that row was not planned/applied. */
     Map<String, Object> get(String source, String table, String oldKey) {
         Group g = groups.get(source + "|" + table);

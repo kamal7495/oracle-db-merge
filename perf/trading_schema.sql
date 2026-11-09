@@ -1,5 +1,6 @@
 -- Trading-style test schema (synthetic, Calypso-like in shape only). Run as the schema owner.
--- Integrity lives in the "application": only two foreign keys are declared, the rest are references by name,
+-- Integrity lives in the "application": only three foreign keys are declared (one a self reference, TRADE.PARENT_TRADE_ID),
+-- the rest are references by name,
 -- a type + ID pair (BO_MESSAGE), a shared-key extension table (PRODUCT_BOND) and keywords keyed by trade.
 WHENEVER SQLERROR EXIT FAILURE
 
@@ -56,8 +57,10 @@ CREATE TABLE TRADE (
   TRADE_STATUS   VARCHAR2(16)  NOT NULL,
   VERSION_NUM    NUMBER(6)     DEFAULT 0 NOT NULL,
   ENTERED_TIME   TIMESTAMP(6)  NOT NULL,
+  PARENT_TRADE_ID NUMBER(12),                      -- amended/novated from: a declared self reference
   CONSTRAINT PK_TRADE PRIMARY KEY (TRADE_ID),
-  CONSTRAINT UQ_TRADE_EXT UNIQUE (EXTERNAL_REF)
+  CONSTRAINT UQ_TRADE_EXT UNIQUE (EXTERNAL_REF),
+  CONSTRAINT FK_TRADE_PARENT FOREIGN KEY (PARENT_TRADE_ID) REFERENCES TRADE (TRADE_ID)
 );
 CREATE INDEX IX_TRADE_BOOK ON TRADE (BOOK_ID, TRADE_DATE);
 

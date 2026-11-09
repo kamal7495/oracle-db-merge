@@ -67,7 +67,7 @@ public final class ScriptRenderer {
                     .append(step.count(RowAction.UNRESOLVED_CONFLICT)).append(" unresolved\n");
             if (work == 0 && step.rows().isEmpty()) continue;
             int rendered = 0;
-            boolean large = step.rows() instanceof SpooledRows;
+            boolean large = step.rows() instanceof PlanRows;
             for (PlannedRow r : step.rows()) {
                 if (large && rendered == LARGE_TABLE_STATEMENTS) {
                     sb.append("-- ... ").append(step.rows().size() - rendered).append(" more planned row(s) of this large table are not written to this")

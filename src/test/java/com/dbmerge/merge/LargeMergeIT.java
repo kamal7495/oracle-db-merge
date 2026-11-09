@@ -43,9 +43,9 @@ import org.testcontainers.oracle.OracleContainer;
 class LargeMergeIT {
 
     private static final String PW = "Sample_pw_1";
-    private static final List<String> TABLES = List.of("REGION", "PRODUCT", "CUSTOMER", "ORDERS", "ORDER_ITEM", "AUDIT_NOTE");
+    private static final List<String> TABLES = List.of("REGION", "PRODUCT", "CUSTOMER", "ORDERS", "ORDER_ITEM", "AUDIT_NOTE", "BOOKH");
     private static final Map<String, List<String>> KEYS = Map.of(
-            "REGION", List.of("NAME"), "PRODUCT", List.of("SKU"), "CUSTOMER", List.of("EMAIL"));
+            "REGION", List.of("NAME"), "PRODUCT", List.of("SKU"), "CUSTOMER", List.of("EMAIL"), "BOOKH", List.of("NAME"));
 
     @Container
     static final OracleContainer ORACLE = new OracleContainer("gvenzl/oracle-free:23-slim-faststart").withPassword("Sys_pw_1");
@@ -69,6 +69,18 @@ class LargeMergeIT {
             try (Connection c = DriverManager.getConnection(url(), u, PW)) {
                 SqlScriptRunner.run(c, u.endsWith("_A") ? "/sample/schema_a.sql" : "/sample/schema_b.sql");
             }
+            // A book hierarchy with a declared self-referencing foreign key, which Oracle checks on every insert.
+            exec(u, "CREATE TABLE bookh (book_id NUMBER(10) PRIMARY KEY, name VARCHAR2(30) NOT NULL UNIQUE, "
+                    + "parent_id NUMBER(10) CONSTRAINT fk_bookh_parent REFERENCES bookh (book_id))");
+            String[] rows = u.endsWith("_A")
+                    ? new String[] {"1, 'Rates', NULL", "2, 'Credit', 1"}
+                    : new String[] {
+                        "1, 'FX', 1",            // a root pointing at itself; id 1 collides with Rates: re-keyed, must point at its new id
+                        "9, 'FX Options', 1",    // child of the re-keyed root
+                        "3, 'FX Exotics', 9",    // grandchild
+                        "2, 'Credit', 1",        // Credit's parent here is FX, in the master Rates: conflict (keep master)
+                        "5, 'Swaps', 2"};        // child of a row matched to the master's Credit
+            for (String r : rows) exec(u, "INSERT INTO bookh VALUES (" + r + ")");
             // The sample scripts fill these with SYSDATE, so copies loaded a second apart would differ before any merge.
             exec(u, "UPDATE customer SET created_at = DATE '2026-01-01'");
             exec(u, "UPDATE orders SET order_date = DATE '2026-01-02'");
@@ -131,6 +143,10 @@ class LargeMergeIT {
         assertTrue(r.log().stream().anyMatch(l -> l.contains("CUSTOMER:")), String.join("\n", r.log()));
 
         for (String t : TABLES) assertEquals(contents("MEM_A", t), contents("STR_A", t), t + " differs between the two paths");
+        assertEquals(List.of(
+                "BOOK_ID=1 NAME=Rates PARENT_ID=null ", "BOOK_ID=10 NAME=FX PARENT_ID=10 ", "BOOK_ID=2 NAME=Credit PARENT_ID=1 ",
+                "BOOK_ID=3 NAME=FX Exotics PARENT_ID=9 ", "BOOK_ID=5 NAME=Swaps PARENT_ID=2 ", "BOOK_ID=9 NAME=FX Options PARENT_ID=10 "),
+                contents("STR_A", "bookh"), "re-keyed root points at its new id, children follow, the master's Credit is kept");
         assertEquals(3, contents("STR_A", "customer").size());
         assertEquals(4, contents("STR_A", "region").size());
         assertEquals(contents("MEM_B", "customer"), contents("STR_B", "customer"), "the sources are never changed");

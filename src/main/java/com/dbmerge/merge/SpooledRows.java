@@ -29,7 +29,7 @@ import java.util.NoSuchElementException;
  * and deleted with {@link #delete()} when the plan is no longer needed (and at JVM exit). It is read back with a
  * deserialization filter that accepts only the plan's own types and JDK value classes.
  */
-final class SpooledRows extends AbstractList<PlannedRow> {
+final class SpooledRows extends AbstractList<PlannedRow> implements PlanRows {
 
     private static final ObjectInputFilter FILTER = ObjectInputFilter.Config.createFilter(
             "com.dbmerge.merge.MergeModel$*;java.lang.*;java.math.*;java.sql.Timestamp;java.time.*;java.util.*;[B;!*");
@@ -81,11 +81,13 @@ final class SpooledRows extends AbstractList<PlannedRow> {
         return this;
     }
 
-    long count(RowAction a) {
+    @Override
+    public long count(RowAction a) {
         return counts.getOrDefault(a, 0L);
     }
 
-    void delete() {
+    @Override
+    public void delete() {
         try {
             Files.deleteIfExists(file);
         } catch (IOException ignored) {

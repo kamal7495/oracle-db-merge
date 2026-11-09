@@ -270,21 +270,41 @@ memory. **Larger tables are streamed**, so a merge is not limited by memory:
 * `StreamingPlannerTest` plans every scenario both ways, including 300 random databases, and requires identical plans;
   `LargeMergeIT` merges the sample schemas both ways on Oracle and requires identical masters.
 
-Limits of the streamed path: no **self-referencing** foreign key (parents must come before children inside the table;
-such a table over the limit is a blocker), the business-key columns must have **the same type** in every database, and
-when two sources bring different new rows with the same primary key, which one keeps it follows key order (the
-in-memory path now uses key order too, so re-keyed `MAX+1` numbers are the same both ways). Plan files take about
-300 bytes per row (1.5 GB for 5 million rows).
+**Self-referencing tables** (a trade amended from another trade, a book under a parent book) are streamed in three
+passes, holding only keys in memory: the first works out where every row goes and collects the hierarchy; then orphans
+are settled down the chains and each row gets a depth (parents first); the second pass redoes the key mapping with the
+orphans known; the third plans the rows and writes them to one plan file per depth, which the executor reads in order,
+so a parent is always written before its children. The rules for a row's parent in the same table, on both paths:
 
-Measured on the perf kit (MacBook, Colima VM with 4 CPUs and 6 GB, Oracle Free 23ai): merging `PERF_C` (1 million trades
-that the master does not have, with 3 million keywords, 1 million messages and 100 000 fees; static data identical)
-into `PERF_A`:
+| The parent row is | The row |
+|---|---|
+| planned (not an orphan) | points at the parent's new key |
+| in the source but an orphan itself | is an orphan too (the whole chain below a broken row is) |
+| not in the source but in the master | keeps the reference (a valid reference to the master's row) |
+| the row itself (a root marked as its own parent) | points at its own new key, also when it is re-keyed |
+| nowhere | is an orphan |
+
+A cycle through the self reference is a blocker. With several sources, when the same new row comes from two of them and
+the conflict rule takes the later one's values, and those values point at a row of this table from the later source, the
+plan refuses that row (blocker): the combined row would have to be written before its parent.
+
+Other limits of the streamed path: the business-key columns must have **the same type** in every database, and when two
+sources bring different new rows with the same primary key, which one keeps it follows key order. The in-memory path now
+uses key order too, so re-keyed `MAX+1` numbers are the same both ways. Plan files take about 300 bytes per row (1.5 GB
+for 5 million rows).
+
+Measured on the perf kit (MacBook, Colima VM with 4 CPUs and 6 GB, Oracle Free 23ai, app heap capped at 768 MB):
+merging `PERF_C` (1 million trades that the master does not have, 300 000 of them amendments of another trade in chains
+up to 4 deep, with 3 million keywords, 1 million messages and 100 000 fees; static data identical) into `PERF_A`:
 
 | Step | Time | Result |
 |---|---|---|
-| Dry run (5.35 M source rows, 5.35 M master rows) | 139 s | 5.1 M inserts, 251 000 duplicates, no blockers |
-| Execute (5.1 M rows + 5.35 M `DBMERGE_ROW_MAP` rows, one transaction) | 97 s | committed; every row count, orphan and sample check passed |
-| Dry run again afterwards (with a 768 MB heap) | 74 s | everything a duplicate: a repeated merge changes nothing |
+| Dry run (5.35 M source rows, 5.35 M master rows; `TRADE` in three passes) | 95 s | 5.1 M inserts, 251 000 duplicates, no blockers |
+| Execute (5.1 M rows + 5.35 M `DBMERGE_ROW_MAP` rows, one transaction) | 75 s | committed; every row count, orphan (including `FK_TRADE_PARENT`) and sample check passed |
+| Peak memory of the whole process | 984 MB | within the 768 MB heap |
+
+Afterwards all 299 799 merged amendment links point at their parent and the deepest chain is 4. A dry run of the same
+merge again finds every row a duplicate: a repeated merge changes nothing.
 
 ### Safety model
 
@@ -351,7 +371,8 @@ Sample schemas live in `src/test/resources/sample/schema_a.sql` (master) and `sc
 A synthetic trading-style schema at realistic volume, to test the comparisons where the sample schemas are too small.
 It is Calypso-like in shape only: names and data are made up.
 
-* `trading_schema.sql`: 11 tables with only two declared foreign keys. The rest of the integrity is undeclared:
+* `trading_schema.sql`: 11 tables with only three declared foreign keys (one of them `TRADE.PARENT_TRADE_ID`, a self
+  reference: chains of up to 3 amendments on 30 % of trades). The rest of the integrity is undeclared:
   references by name (`TRADE.BOOK_ID`, `BOOK.LE_ID`), a role prefix (`ISSUER_LE_ID`), a 1:1 extension table sharing
   its key (`PRODUCT_BOND`), a type + ID pair (`BO_MESSAGE.OBJECT_ID`/`OBJECT_CLASS`), an ID with no table (`CPTY_ID`).
   It also has views, a package, a function, a synonym, grants, and `BKP_`/`TMP_` leftovers.

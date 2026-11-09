@@ -86,7 +86,7 @@ public class MergeService {
 
     /** Deletes a plan's files (large tables); the plan cannot be read or run afterwards. */
     private static void discard(MergePlan plan) {
-        for (var s : plan.steps()) if (s.rows() instanceof SpooledRows spooled) spooled.delete();
+        for (var s : plan.steps()) if (s.rows() instanceof PlanRows planned) planned.delete();
     }
 
     private MergeResult refuse(MergePlan plan, String why) {

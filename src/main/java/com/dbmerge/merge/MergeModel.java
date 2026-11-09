@@ -56,7 +56,7 @@ public final class MergeModel {
             List<PlannedRow> rows) {
 
         public long count(RowAction a) {
-            if (rows instanceof SpooledRows spooled) return spooled.count(a); // no need to read the plan file
+            if (rows instanceof PlanRows planned) return planned.count(a); // no need to read the plan file
             return rows.stream().filter(r -> r.action() == a).count();
         }
     }

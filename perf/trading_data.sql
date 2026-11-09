@@ -45,7 +45,9 @@ SELECT n, 'EXT-' || LPAD(n, 10, '0'), MOD(n * 31, 2000) + 1, MOD(n * 17, 5000) +
        MOD(n, 1000) * 1000 + 1000, ROUND(90 + MOD(n, 2000) / 100, 8), (MOD(n, 1000) * 1000 + 1000) * (90 + MOD(n, 2000) / 100),
        CASE MOD(n, 3) WHEN 0 THEN 'USD' WHEN 1 THEN 'EUR' ELSE 'GBP' END,
        CASE WHEN MOD(n, 50) = 0 THEN 'CANCELED' WHEN MOD(n, 7) = 0 THEN 'PENDING' ELSE 'VERIFIED' END,
-       MOD(n, 4), TIMESTAMP '2024-01-01 08:00:00' + NUMTODSINTERVAL(MOD(n, 900 * 86400), 'SECOND')
+       MOD(n, 4), TIMESTAMP '2024-01-01 08:00:00' + NUMTODSINTERVAL(MOD(n, 900 * 86400), 'SECOND'),
+       -- chains of up to 3 amendments: ...1 -> ...0, ...2 -> ...1, ...3 -> ...2 (none under the trades drift_b deletes)
+       CASE WHEN MOD(n, 10) IN (1, 2, 3) AND MOD(n, 5000) <> 3 AND n - 1 > &OFFSET THEN n - 1 END
   FROM (SELECT (a.r - 1) * 1000 + b.r + &OFFSET AS n
           FROM (SELECT level r FROM dual CONNECT BY level <= CEIL(&TRADES / 1000)) a
          CROSS JOIN (SELECT level r FROM dual CONNECT BY level <= 1000) b)

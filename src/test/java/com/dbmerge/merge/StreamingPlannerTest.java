@@ -105,7 +105,7 @@ class StreamingPlannerTest {
         }
         List<String> issues = new ArrayList<>();
         for (Issue i : p.issues()) {
-            if (i.level() == Level.INFO && i.message().startsWith("Large table")) continue;
+            if (i.level() == Level.INFO && (i.message().startsWith("Large table") || i.message().startsWith("Self-referencing"))) continue;
             issues.add(i.level() + " " + i.table() + ": " + i.message());
         }
         issues.sort(null);
@@ -116,21 +116,46 @@ class StreamingPlannerTest {
     private void assertSamePlan(Map<String, List<Map<String, Object>>> db, List<String> sources, Rules rules, Options opt) throws Exception {
         MergePlan mem = plan(db, sources, rules, opt, false);
         MergePlan str = plan(db, sources, rules, opt, true);
-        Map<String, List<String>> a = normal(mem), b = normal(str);
-        if (!a.equals(b)) {
-            StringBuilder d = new StringBuilder();
-            for (String k : new java.util.TreeSet<>(java.util.Set.copyOf(new ArrayList<String>() {{ addAll(a.keySet()); addAll(b.keySet()); }}))) {
-                List<String> x = new ArrayList<>(a.getOrDefault(k, List.of())), y = new ArrayList<>(b.getOrDefault(k, List.of()));
-                List<String> onlyMem = new ArrayList<>(x), onlyStr = new ArrayList<>(y);
-                y.forEach(onlyMem::remove);
-                x.forEach(onlyStr::remove);
-                for (String r : onlyMem) d.append("\n  in memory only  ").append(k).append(": ").append(r);
-                for (String r : onlyStr) d.append("\n  streaming only  ").append(k).append(": ").append(r);
-            }
-            throw new AssertionError("plans differ:" + d);
-        }
+        assertSameNormal(mem, str);
         assertEquals(mem.hasBlockers(), str.hasBlockers());
         assertTrue(str.issues().stream().anyMatch(i -> i.message().startsWith("Large table")), "streaming was really used");
+    }
+
+    /** A plan with INSERT and INSERT_REMAPPED rows reduced to "an insert of this source row", without the key it got. */
+    private static Map<String, List<String>> insertsAsOne(Map<String, List<String>> plan) {
+        Map<String, List<String>> out = new TreeMap<>();
+        plan.forEach((table, rows) -> {
+            List<String> r = new ArrayList<>();
+            for (String row : rows) {
+                row = row.replaceAll("masterPk=\\[[^]]*]", "masterPk=?"); // the key a row ended up with or matched to
+                if (row.contains(" INSERT old=") || row.contains(" INSERT_REMAPPED old=")) {
+                    row = row.replace(" INSERT_REMAPPED old=", " INSERT old=").replaceAll("masterPk=\\[[^]]*]", "masterPk=?")
+                            .replaceAll("BOOK_ID=\\d+", "BOOK_ID=?").replaceAll(" note=.*$", "");
+                }
+                r.add(row);
+            }
+            r.sort(null);
+            out.put(table.startsWith("~") ? table : table, r);
+        });
+        out.computeIfPresent("~issues", (k, v) -> v.stream().filter(i -> !i.contains("may later hand out a key")).toList());
+        return out;
+    }
+
+    /** Fails with only the rows that are in one plan and not the other. */
+    private static void assertSameNormal(MergePlan mem, MergePlan str) {
+        Map<String, List<String>> a = normal(mem), b = normal(str);
+        if (a.equals(b)) return;
+        StringBuilder d = new StringBuilder();
+        java.util.Set<String> keys = new java.util.TreeSet<>(a.keySet());
+        keys.addAll(b.keySet());
+        for (String k : keys) {
+            List<String> onlyMem = new ArrayList<>(a.getOrDefault(k, List.of())), onlyStr = new ArrayList<>(b.getOrDefault(k, List.of()));
+            b.getOrDefault(k, List.of()).forEach(onlyMem::remove);
+            a.getOrDefault(k, List.of()).forEach(onlyStr::remove);
+            for (String r : onlyMem) d.append("\n  in memory only  ").append(k).append(": ").append(r);
+            for (String r : onlyStr) d.append("\n  streaming only  ").append(k).append(": ").append(r);
+        }
+        throw new AssertionError("plans differ:" + d);
     }
 
     private static Map<String, List<Map<String, Object>>> sampleDb() {
@@ -227,5 +252,170 @@ class StreamingPlannerTest {
                 throw new AssertionError("round " + round + " with " + db + ": " + e.getMessage(), e);
             }
         }
+    }
+
+    // ------------------------------------------------------------------ self-referencing tables
+
+    /** REGION, and BOOK with two self references (PARENT_ID, ALT_PARENT_ID), matched on NAME; no sequence (MAX+1). */
+    private static SchemaModel books(String nick) {
+        TableDef region = table("REGION").col(number("REGION_ID", 1, 10, 0, false)).cons(pk("PK_REGION", false, "REGION_ID")).build();
+        TableDef book = table("BOOK")
+                .col(number("BOOK_ID", 1, 10, 0, false), varchar("NAME", 2, 30, false), number("REGION_ID", 3, 10, 0, true),
+                        number("PARENT_ID", 4, 10, 0, true), number("ALT_PARENT_ID", 5, 10, 0, true))
+                .cons(pk("PK_BOOK", false, "BOOK_ID"), unique("UQ_BOOK_NAME", false, "NAME"),
+                        fk("FK_BOOK_REGION", false, "REGION_ID", "REGION", "REGION_ID"),
+                        fk("FK_BOOK_PARENT", false, "PARENT_ID", "BOOK", "BOOK_ID"),
+                        fk("FK_BOOK_ALT", false, "ALT_PARENT_ID", "BOOK", "BOOK_ID")).build();
+        return model(nick, region, book);
+    }
+
+    private MergePlan planBooks(Map<String, List<Map<String, Object>>> db, List<String> sources, Rules rules, Options opt, boolean stream)
+            throws Exception {
+        Map<String, SchemaModel> models = new LinkedHashMap<>();
+        models.put("M", books("M"));
+        for (String s : sources) models.put(s, books(s));
+        MergePlanner p = stream ? new MergePlanner(data(db), 0, spool) : new MergePlanner(data(db));
+        return p.plan("M", sources, models, Map.of("BOOK", List.of("NAME")), rules, opt);
+    }
+
+    /** Every row comes after the rows of its own table and source that it references: what the executor relies on. */
+    private static void assertParentsFirst(MergePlan p) {
+        for (TableStep s : p.steps()) {
+            java.util.Set<String> seen = new java.util.HashSet<>();
+            for (PlannedRow r : s.rows()) {
+                for (Object v : r.values().values()) {
+                    boolean itself = v instanceof FkRef f0 && f0.sourceDb().equals(r.sourceDb()) && f0.oldKey().equals(r.oldKey());
+                    if (v instanceof FkRef f && f.parentTable().equals(s.table()) && !itself) {
+                        assertTrue(seen.contains(f.sourceDb() + "|" + f.oldKey()), (p.issues().stream().anyMatch(i -> i.message()
+                                .startsWith("Large table")) ? "streaming: " : "in memory: ") + s.table() + " " + r.action() + " row "
+                                + r.sourceDb() + "|" + r.oldKey() + " comes before its parent " + f.oldKey());
+                    }
+                }
+                seen.add(r.sourceDb() + "|" + r.oldKey());
+            }
+        }
+    }
+
+    private void assertSameBooks(Map<String, List<Map<String, Object>>> db, List<String> sources, Rules rules, Options opt) throws Exception {
+        MergePlan mem = planBooks(db, sources, rules, opt, false);
+        MergePlan str = planBooks(db, sources, rules, opt, true);
+        boolean memCycle = mem.issues().stream().anyMatch(i -> i.level() == Level.BLOCKER && i.message().contains("cycle"));
+        boolean strCycle = str.issues().stream().anyMatch(i -> i.level() == Level.BLOCKER && i.message().contains("cycle"));
+        assertEquals(memCycle, strCycle, "a cycle must block both ways");
+        if (memCycle) return; // the plan cannot run; the paths report it differently (rows planned around it vs none)
+        if (sources.size() == 1) {
+            assertSameNormal(mem, str);
+        } else {
+            // With several sources, two different new rows may bring the same id; which one keeps it follows source
+            // order in memory and key order when streamed (both valid). Compare everything else exactly.
+            Map<String, List<String>> a = insertsAsOne(normal(mem)), b = insertsAsOne(normal(str));
+            if (!a.equals(b)) {
+                StringBuilder d = new StringBuilder();
+                for (String k : new java.util.TreeSet<>(a.keySet())) {
+                    List<String> x = new ArrayList<>(a.get(k)), y = new ArrayList<>(b.getOrDefault(k, List.of()));
+                    List<String> ox = new ArrayList<>(x), oy = new ArrayList<>(y);
+                    y.forEach(ox::remove);
+                    x.forEach(oy::remove);
+                    ox.forEach(r -> d.append("\n  in memory only  ").append(r));
+                    oy.forEach(r -> d.append("\n  streaming only  ").append(r));
+                }
+                throw new AssertionError("plans differ beyond who kept a colliding id:" + d);
+            }
+        }
+        assertParentsFirst(mem);
+        assertParentsFirst(str);
+    }
+
+    @Test
+    void selfReferencesAreRewrittenOrphansCascadeAndParentsComeFirst() throws Exception {
+        Map<String, List<Map<String, Object>>> db = new LinkedHashMap<>();
+        db.put("M|REGION", List.of(row("REGION_ID", n(1))));
+        db.put("S1|REGION", List.of(row("REGION_ID", n(1))));
+        db.put("M|BOOK", List.of(row("BOOK_ID", n(1), "NAME", "Rates", "REGION_ID", n(1), "PARENT_ID", null, "ALT_PARENT_ID", null),
+                row("BOOK_ID", n(2), "NAME", "Credit", "REGION_ID", n(1), "PARENT_ID", n(1), "ALT_PARENT_ID", null)));
+        db.put("S1|BOOK", List.of(
+                row("BOOK_ID", n(9), "NAME", "FX Options", "REGION_ID", n(1), "PARENT_ID", n(1), "ALT_PARENT_ID", null), // child before parent in key order
+                row("BOOK_ID", n(1), "NAME", "FX", "REGION_ID", n(1), "PARENT_ID", null, "ALT_PARENT_ID", null),         // collides: re-keyed (MAX+1)
+                row("BOOK_ID", n(3), "NAME", "Swaps", "REGION_ID", n(1), "PARENT_ID", n(2), "ALT_PARENT_ID", n(9)),     // parent only in the master
+                row("BOOK_ID", n(4), "NAME", "Bad region", "REGION_ID", n(77), "PARENT_ID", null, "ALT_PARENT_ID", null), // orphan (region)
+                row("BOOK_ID", n(5), "NAME", "Under bad", "REGION_ID", n(1), "PARENT_ID", n(4), "ALT_PARENT_ID", null),  // child of an orphan
+                row("BOOK_ID", n(6), "NAME", "Grandchild", "REGION_ID", n(1), "PARENT_ID", n(5), "ALT_PARENT_ID", null), // and its child
+                row("BOOK_ID", n(7), "NAME", "Lost", "REGION_ID", n(1), "PARENT_ID", n(555), "ALT_PARENT_ID", null)));   // parent nowhere
+        for (OrphanPolicy op : OrphanPolicy.values()) {
+            Options opt = new Options(false, op, Map.of());
+            assertSameBooks(db, List.of("S1"), new Rules(), opt);
+            MergePlan p = planBooks(db, List.of("S1"), new Rules(), opt, true);
+            TableStep book = p.steps().stream().filter(t -> t.table().equals("BOOK")).findFirst().orElseThrow();
+            assertEquals(4, book.count(MergeModel.RowAction.SKIP_ORPHAN), "bad region, its child and grandchild, and the lost one");
+            PlannedRow fxOptions = book.rows().stream().filter(r -> r.businessKey().contains("FX Options")).findFirst().orElseThrow();
+            assertEquals(new FkRef("BOOK", "S1", "1", "BOOK_ID"), fxOptions.values().get("PARENT_ID"), "follows its re-keyed parent");
+            PlannedRow swaps = book.rows().stream().filter(r -> r.businessKey().contains("Swaps")).findFirst().orElseThrow();
+            assertEquals(n(2), swaps.values().get("PARENT_ID"), "a parent that exists only in the master stays as it is");
+        }
+    }
+
+    @Test
+    void aCycleThroughTheSelfReferenceIsABlockerBothWays() throws Exception {
+        Map<String, List<Map<String, Object>>> db = new LinkedHashMap<>();
+        db.put("M|REGION", List.of(row("REGION_ID", n(1))));
+        db.put("S1|BOOK", List.of(row("BOOK_ID", n(1), "NAME", "A", "REGION_ID", null, "PARENT_ID", n(2), "ALT_PARENT_ID", null),
+                row("BOOK_ID", n(2), "NAME", "B", "REGION_ID", null, "PARENT_ID", n(1), "ALT_PARENT_ID", null)));
+        for (boolean stream : new boolean[] {false, true}) {
+            MergePlan p = planBooks(db, List.of("S1"), new Rules(), Options.defaults(), stream);
+            assertTrue(p.issues().stream().anyMatch(i -> i.level() == Level.BLOCKER && i.message().contains("cycle")), "stream=" + stream);
+        }
+    }
+
+    @Test
+    void randomHierarchiesPlanTheSameBothWays() throws Exception {
+        Random rnd = new Random(11);
+        for (int round = 0; round < 300; round++) {
+            Map<String, List<Map<String, Object>>> db = new LinkedHashMap<>();
+            List<String> sources = rnd.nextInt(3) == 0 ? List.of("S1", "S2") : List.of("S1");
+            List<Integer> masterIds = new ArrayList<>();
+            for (String d : new ArrayList<String>() {{ add("M"); addAll(sources); }}) {
+                db.put(d + "|REGION", List.of(row("REGION_ID", n(1)), row("REGION_ID", n(2))));
+                List<Map<String, Object>> books = new ArrayList<>();
+                List<Integer> ids = new ArrayList<>();
+                int count = 2 + rnd.nextInt(9);
+                for (int i = 0; i < count; i++) {
+                    int id = 1 + rnd.nextInt(14);
+                    if (ids.contains(id)) continue;
+                    String name = "B" + rnd.nextInt(12);
+                    if (books.stream().anyMatch(b -> b.get("NAME").equals(name))) continue;
+                    Integer parent = pickParent(rnd, ids, masterIds, d.equals("M"));
+                    Integer alt = rnd.nextInt(4) == 0 ? pickParent(rnd, ids, masterIds, d.equals("M")) : null;
+                    int region = rnd.nextInt(10) == 0 ? 99 : 1 + rnd.nextInt(2);           // 99: orphan by region
+                    books.add(row("BOOK_ID", n(id), "NAME", name, "REGION_ID", n(region),
+                            "PARENT_ID", parent == null ? null : n(parent), "ALT_PARENT_ID", alt == null ? null : n(alt)));
+                    ids.add(id);
+                }
+                if (d.equals("M")) {
+                    books.removeIf(b -> b.get("REGION_ID").equals(n(99)) || b.get("PARENT_ID") != null);  // a clean master
+                    masterIds.clear();
+                    books.forEach(b -> masterIds.add(((BigDecimal) b.get("BOOK_ID")).intValue()));
+                }
+                db.put(d + "|BOOK", books);
+            }
+            ConflictAction[] actions = {null, ConflictAction.KEEP_MASTER, ConflictAction.TAKE_SOURCE};
+            ConflictAction a = actions[rnd.nextInt(actions.length)];
+            Rules rules = new Rules();
+            if (a != null) for (String t : List.of("REGION", "BOOK")) rules.getTables().put(t, new Rules.TableRule(a, null));
+            Options opt = new Options(false, rnd.nextBoolean() ? OrphanPolicy.FAIL : OrphanPolicy.SKIP, Map.of());
+            try {
+                assertSameBooks(db, sources, rules, opt);
+            } catch (AssertionError e) {
+                throw new AssertionError("round " + round + ": " + e.getMessage(), e);
+            }
+        }
+    }
+
+    /** A parent that does not create a cycle: an earlier row, a master row, a missing key (500+), or none. */
+    private static Integer pickParent(Random rnd, List<Integer> earlier, List<Integer> master, boolean isMaster) {
+        int r = rnd.nextInt(5);
+        if (r == 0 || (r == 1 && earlier.isEmpty())) return null;
+        if (r <= 2 && !earlier.isEmpty()) return earlier.get(rnd.nextInt(earlier.size()));
+        if (r == 3 && !master.isEmpty() && !isMaster) return master.get(rnd.nextInt(master.size()));
+        return 500 + rnd.nextInt(5);
     }
 }
