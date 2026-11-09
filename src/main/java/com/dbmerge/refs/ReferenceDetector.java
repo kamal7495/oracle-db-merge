@@ -193,8 +193,11 @@ public class ReferenceDetector {
             break;
         }
 
-        // 5. looks like an identifier, nothing matches
-        for (String suffix : UNRESOLVED_SUFFIXES) {
+        // 5. looks like an identifier, nothing matches. A column that is unique on its own (EXTERNAL_REF with a UNIQUE
+        // constraint) is a natural key of its own table, not a reference to another one.
+        boolean ownKey = t.constraints().stream().anyMatch(c -> ("U".equals(c.type()) || "P".equals(c.type()))
+                && c.columns().size() == 1 && c.columns().get(0).equals(n));
+        for (String suffix : ownKey ? List.<String>of() : UNRESOLVED_SUFFIXES) {
             if (n.endsWith(suffix) && n.length() > suffix.length()) {
                 return new Candidate(t.name(), n, col.displayType(), Kind.UNRESOLVED_ID, Confidence.LOW, List.of(), null,
                         "named like an identifier (" + suffix + ") but no table matches",

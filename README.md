@@ -57,14 +57,17 @@ java -jar target/oracle-db-merge-*.jar cli help            # or: cli <command> -
 | Command | What it does | Fails (exit 1) when |
 |---|---|---|
 | `connections [--test]` | lists saved and configured connections; `--test` connects to each | `--test` and a connection fails or is locked (exit 3) |
-| `ddl A B [C...]` | Phase 1 comparison, writes `ddl-<id>.html` and `.xlsx` | a difference at or above `--fail-on` (`CRITICAL`, `HIGH` default, `MEDIUM`, `LOW`, `NEVER`) |
-| `data A B [C...]` | Phase 2 comparison, writes `data-<id>.html` and `.xlsx`. `--tables T1,T2`, `--key TABLE=COL1,COL2` | any difference: rows only in some databases, conflicts, key collisions, different row counts, a table in only one database. Tables that could not be compared (no key, error) also fail unless `--allow-uncompared` |
+| `ddl A B [C...]` | Phase 1 comparison, writes `ddl-<id>.html` and `.xlsx`. `--snapshot FILE` adds a saved snapshot (so `ddl A --snapshot base.json` works) | a difference at or above `--fail-on` (`CRITICAL`, `HIGH` default, `MEDIUM`, `LOW`, `NEVER`) |
+| `data A B [C...]` | Phase 2 comparison, writes `data-<id>.html` and `.xlsx`. `--tables T1,T2`, `--key TABLE=COL1,COL2`, `--max-rows N` (above N rows, compare by hash; `0` hashes every table) | any difference: rows only in some databases, conflicts, key collisions, different row counts, a table in only one database. Tables that could not be compared (no key, error) also fail unless `--allow-uncompared` |
 | `refs A` | undeclared-reference report, writes `refs-<id>.html`. `--check-data [--timeout S] [--max-checks N]` | a candidate at or above `--fail-on` confidence (`HIGH` default, `MEDIUM`, `LOW`, `NEVER`) |
+| `snapshot A [--file F]` | saves A's structure to a JSON file (default `snapshot-A-<time>.json`), see [Snapshots](#snapshots) | never (exit 0) |
 | `plan --master M S [S...]` | merge **dry run**, writes `merge-<id>.html` and the review `.sql`. `--key`, `--ack TABLE.COLUMN`, `--sequence TABLE=SEQ`, `--orphans fail\|skip`, `--rules FILE` | any blocker (including unresolved conflicts and undeclared references that would break); also warnings with `--fail-on-warnings` |
 
 There is **no command that executes a merge**: review the dry run and execute it from the web UI.
 
 Common options: `--out DIR` (reports, default `reports`), `--json` (JSON summary on stdout), `--store-dir DIR`, `--profile NAME`, `--config FILE`, `--password-env NICK=VAR`.
+
+Filters, for `ddl`, `data`, `refs`, `plan` and `snapshot`: `--exclude 'BKP_*,TMP_*'`, `--include 'TRADE*'` and, except for `refs` and `snapshot`, `--ignore CONSTRAINT_NAME_MISMATCH,GRANT`. See [Filters](#filters-and-ignored-differences).
 
 **Exit codes:** `0` pass · `1` findings at or above the threshold · `2` usage error (bad arguments, unknown or locked connection, missing environment variable) · `3` connection or runtime error.
 
@@ -92,6 +95,47 @@ Example: a nightly drift check in GitHub Actions, with the connections in a conf
 java -jar oracle-db-merge.jar cli refs CALYPSO_UAT --check-data --fail-on MEDIUM
 case $? in 0) echo clean ;; 1) echo "review refs report" ;; 2) echo "fix the command" ;; *) echo "database problem" ;; esac
 ```
+
+## Filters and ignored differences
+
+Real vendor schemas carry hundreds of backup and scratch tables (`BKP_TRADE_2023`, `TMP_RECON_STAGE`) that drown the
+findings that matter. In the UI (Phase 1) or on the command line:
+
+* **Leave out objects** (`--exclude`) and **only these objects** (`--include`): comma-separated name patterns,
+  case-insensitive. `*` or `%` match any characters and `?` one; `_` is literal, since nearly every Oracle name has one.
+  An object is kept when it matches an include pattern (or none is given) and no exclude pattern. Patterns apply to
+  tables (with their columns, constraints, indexes and triggers), sequences, views, materialized views, PL/SQL and
+  synonyms by name, and to grants by the object granted on.
+* **Ignore differences of kind** (`--ignore`): a kind such as `CONSTRAINT_NAME_MISMATCH`, `INDEX_NAME_MISMATCH`,
+  `DEFAULT_MISMATCH`, `SEQUENCE_PARAM_MISMATCH`, or a whole category: `TABLE`, `COLUMN`, `CONSTRAINT`, `INDEX`,
+  `SEQUENCE`, `TRIGGER`, `VIEW`, `MVIEW`, `PLSQL`, `CODE`, `SYNONYM`, `GRANT`. These findings are dropped from the
+  result; nothing else changes.
+* The filter is applied when the DDL comparison runs, and the data comparison and merge plan reuse that comparison, so
+  **a left-out table is left out of them too**. If a kept table has a declared foreign key to a left-out table, the
+  comparison warns: a merge would copy those foreign-key values unchanged, so they must already exist in the master.
+* Every report and summary states the filter (`Filtered: exclude BKP_*, TMP_*; ignore MISSING_GRANT, …`), so a
+  filtered report is never mistaken for a full one.
+* Storage clauses, tablespaces and physical attributes are not compared at all, so there is nothing to ignore there.
+
+## Snapshots
+
+A snapshot is a schema's structure saved to a JSON file: tables, columns, keys, indexes, triggers, sequences, views,
+PL/SQL source, synonyms and grants. **No row data, no passwords** and no host details; DBMS_METADATA text is left out
+to keep it small. Compare live databases against it later, for example "has production drifted from the release-1.4
+baseline?", without a second database:
+
+```bash
+java -jar oracle-db-merge.jar cli snapshot PROD --exclude 'BKP_*,TMP_*' --file baselines/release-1.4.json
+java -jar oracle-db-merge.jar cli ddl PROD --snapshot baselines/release-1.4.json --exclude 'BKP_*,TMP_*' --fail-on MEDIUM
+```
+
+* A snapshot takes its name from the file (`release-1.4.json` → `release-1_4`), so a baseline of `PROD` can be compared
+  with the live `PROD`. Its first warning says which database and schema it came from, when, and with which filter.
+* In the UI: each Phase 1 result has *Save a snapshot* links (one per database, filtered as that run was), and
+  *Compare with snapshot file(s)* takes uploaded snapshots alongside the ticked connections.
+* Snapshots can be committed to Git next to the release scripts. The JSON is pretty-printed, with objects in the order
+  they were extracted, so diffs between snapshots are readable but not guaranteed minimal.
+* Data comparison and merging need live rows: a comparison that includes a snapshot is refused for those phases.
 
 ## Passwords
 
@@ -235,7 +279,7 @@ Limits: detection works from names, so it misses references whose names do not m
 
 ```bash
 mvn test      # unit tests (no database): comparator, registry, row matcher, FK graph, planner, script/alter generators, report writers, reference detector
-mvn verify    # also the Testcontainers integration tests (needs Docker): SchemaExtractorIT, MergeIT, LobMergeIT, ReferenceIT
+mvn verify    # also the Testcontainers integration tests (needs Docker): SchemaExtractorIT, MergeIT, LobMergeIT, ReferenceIT, DataHashCompareIT
 ```
 
 The integration tests are skipped, not failed, when Testcontainers finds no Docker, so check the output says `Skipped: 0`. With Colima instead of Docker Desktop:
@@ -250,14 +294,48 @@ mvn verify
 
 Sample schemas live in `src/test/resources/sample/schema_a.sql` (master) and `schema_b.sql` (source): FK chain `REGION ← CUSTOMER ← ORDERS ← ORDER_ITEM → PRODUCT`, PK collisions (customer 1 is Alice in A, Carol in B), identical duplicates (Bob, Widget), same person with different PK (Alice 1 vs 3), a table only in B (`AUDIT_NOTE`), a wider `EMAIL`, a different `QTY` type, an extra column, a missing index/trigger, and an order status that violates A's check constraint (used to prove rollback).
 
+## Performance test kit (`perf/`)
+
+A synthetic trading-style schema at realistic volume, to test the comparisons where the sample schemas are too small.
+It is Calypso-like in shape only: names and data are made up.
+
+* `trading_schema.sql`: 11 tables with only two declared foreign keys. The rest of the integrity is undeclared:
+  references by name (`TRADE.BOOK_ID`, `BOOK.LE_ID`), a role prefix (`ISSUER_LE_ID`), a 1:1 extension table sharing
+  its key (`PRODUCT_BOND`), a type + ID pair (`BO_MESSAGE.OBJECT_ID`/`OBJECT_CLASS`), an ID with no table (`CPTY_ID`).
+  It also has views, a package, a function, a synonym, grants, and `BKP_`/`TMP_` leftovers.
+* `trading_data.sql N`: N trades, 3 keywords and 1 message each, 1 fee per 10, plus 200 000 products and 5 000 legal
+  entities, generated inside the database. For N = 1 000 000 that is 5.35 million rows per schema.
+* `drift_b.sql N`: makes `PERF_B` differ in countable ways: prices changed on 1 trade in 1 000, 1 in 5 000 deleted
+  with its children, 100 new trades, 1 in 2 000 desk keywords changed, a new column, a changed package body, a
+  dropped view, a missing grant and an extra backup table.
+* `setup.sh [N] [container]` creates `PERF_A`/`PERF_B` and loads both (about 80 s for 1 million trades on the Colima
+  container). It needs `ORACLE_PASSWORD` (SYSTEM) and `DBMERGE_PERF_PASSWORD`. Passwords go to the container by
+  variable name and reach sqlplus on stdin, never as process arguments.
+* `run.sh [out]` times each command-line comparison against them and records peak memory.
+
+Results for 1 million trades (MacBook, Colima VM with 4 CPUs and 6 GB, Oracle Free 23ai, `-Xmx1g`):
+
+| Run | Time | Peak memory | Result |
+|---|---|---|---|
+| `ddl PERF_A PERF_B` | 3 s | 235 MB | the 3 planted schema changes (plus the backup table and grant without the filter) |
+| `refs PERF_A --check-data` (filtered) | 3 s | 230 MB | 9 findings, all real: every planted reference, with 100 % resolution, and the ambiguous `TRADE.PRODUCT_ID` resolved by data (100 % to `PRODUCT_DESC`, 20 % to `PRODUCT_BOND`) |
+| `data PERF_A PERF_B` (all tables, hash) | 200 s | 665 MB | exact: `TRADE` 1 000 conflicts / 300 only in one, `TRADE_KEYWORD` 500 / 600, `BO_MESSAGE` 0 / 200 |
+| `data --tables TRADE --max-rows 0` | 52 s | 290 MB | as above for `TRADE` |
+| `snapshot` + `ddl PERF_B --snapshot` | 3 s each | 235 MB | a 42 KB snapshot; live `PERF_A` vs its snapshot shows 0 differences, `PERF_B` the 3 changes |
+
+Memory stays flat as tables grow: it follows the number of differing rows, not the table size. Time is dominated by
+the database's full scans, about 50 s per million rows of a wide table on this container. The same comparison with
+`--max-rows 200000` (the in-memory path) gives identical counts at 10 000 trades.
+
 ## Layout
 
 ```
-cli/     command-line mode (no web server): argument parsing, exit codes, ddl/data/refs/plan/connections
+cli/     command-line mode (no web server): argument parsing, exit codes, ddl/data/refs/plan/snapshot/connections
 conn/    connection registry, encrypted saved connections, read-only / master-only connections
-ddl/     extractor, model, comparator, HTML+Excel report
+ddl/     extractor, model, comparator, filters, snapshots, HTML+Excel report
 data/    row loader, matcher, compare service, HTML+Excel report
 merge/   planner, FK graph, ALTER generator, script renderer, executor, rules, service, report
 refs/    undeclared-reference detector, data check, HTML report
 web/     REST controllers; static/index.html is the UI
+perf/    (repo root) synthetic trading schema, data generator, drift script, timing runner
 ```

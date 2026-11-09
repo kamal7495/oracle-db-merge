@@ -118,4 +118,28 @@ class CliArgsTest {
         }
         parse("ddl", "A", "B", "--password-env", "A=VAR"); // --password-env itself is fine
     }
+
+    @Test
+    void filterOptionsAreParsedAndValidated() {
+        CliArgs a = parse("ddl", "A", "B", "--exclude", "BKP_*,TMP_*", "--exclude", "OLD_%", "--ignore", "GRANT");
+        assertEquals("exclude BKP_*, TMP_*, OLD_%; ignore GRANT_OPTION_MISMATCH, MISSING_GRANT", a.filter().describe());
+        assertTrue(parse("data", "A", "B").filter().isEmpty());
+        assertTrue(usage("ddl", "A", "B", "--exclude", "A;B").contains("Invalid name pattern"));
+        assertTrue(usage("ddl", "A", "B", "--ignore", "EVERYTHING").contains("Unknown difference kind"));
+        assertTrue(usage("refs", "A", "--ignore", "GRANT").contains("ignore"), "findings are not compared in refs");
+        assertTrue(usage("connections", "--exclude", "X").contains("exclude"));
+        assertEquals(0, parse("data", "A", "B", "--max-rows", "0").intOption("max-rows", 200_000, 0, Integer.MAX_VALUE));
+        assertTrue(usage("data", "A", "B", "--max-rows", "-1").contains("max-rows"));
+    }
+
+    @Test
+    void snapshotCommandAndDdlAgainstSnapshots() {
+        assertEquals(Command.SNAPSHOT, parse("snapshot", "DB_A", "--file", "base.json", "--exclude", "BKP_*").command());
+        assertTrue(usage("snapshot", "DB_A", "DB_B").contains("exactly one"));
+        assertTrue(usage("snapshot", "DB_A", "--ignore", "GRANT").contains("ignore"));
+        assertEquals(List.of("base.json"), parse("ddl", "DB_A", "--snapshot", "base.json").values("snapshot"));
+        assertEquals(2, parse("ddl", "--snapshot", "a.json", "--snapshot", "b.json").values("snapshot").size());
+        assertTrue(usage("ddl", "DB_A").contains("--snapshot"), "one live database alone is not enough");
+        assertTrue(usage("data", "DB_A", "--snapshot", "x.json").contains("snapshot"), "data needs live rows");
+    }
 }

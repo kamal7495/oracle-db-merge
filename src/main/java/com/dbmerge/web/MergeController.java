@@ -52,7 +52,7 @@ public class MergeController {
     @PostMapping("/plan")
     public Map<String, Object> plan(@RequestBody PlanRequest req) throws SQLException, IOException {
         if (req.ddlId() == null) throw new IllegalArgumentException("ddlId is required (run the DDL comparison first).");
-        ComparisonResult ddl = store.get(req.ddlId()).orElseThrow(() -> new IllegalArgumentException("Unknown DDL comparison: " + req.ddlId()));
+        ComparisonResult ddl = store.requireLive(req.ddlId());
         Options options = new Options(Boolean.TRUE.equals(req.disableTriggers()),
                 req.orphanPolicy() == null ? OrphanPolicy.FAIL : OrphanPolicy.valueOf(req.orphanPolicy().toUpperCase()),
                 req.pkSequences() == null ? Map.of() : req.pkSequences(),

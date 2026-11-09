@@ -15,7 +15,9 @@ import com.dbmerge.data.DataModel.TableDataResult;
 import com.dbmerge.ddl.SchemaExtractor;
 import com.dbmerge.ddl.compare.ComparisonResult;
 import com.dbmerge.ddl.compare.Difference;
+import com.dbmerge.ddl.compare.CompareFilter;
 import com.dbmerge.ddl.compare.SchemaComparator;
+import com.dbmerge.ddl.model.SchemaSnapshot;
 import com.dbmerge.ddl.compare.Severity;
 import com.dbmerge.ddl.model.SchemaModel;
 import com.dbmerge.ddl.report.ExcelReportWriter;
@@ -102,6 +104,12 @@ public final class Cli {
                 return ExitCodes.USAGE;
             }
         }
+        for (String snap : a.values("snapshot")) {
+            if (!Files.isRegularFile(Path.of(snap))) {
+                err.println("error: --snapshot file not found: " + snap);
+                return ExitCodes.USAGE;
+            }
+        }
         Path outDir = Path.of(a.value("out") == null ? "reports" : a.value("out")).toAbsolutePath().normalize();
         try (ConfigurableApplicationContext ctx = startContext(a, outDir)) {
             ConnectionRegistry registry = ctx.getBean(ConnectionRegistry.class);
@@ -113,6 +121,7 @@ public final class Cli {
                 case DATA -> data(a, ctx, outDir);
                 case REFS -> refs(a, ctx, outDir);
                 case PLAN -> plan(a, ctx);
+                case SNAPSHOT -> snapshot(a, ctx, outDir);
                 case HELP -> throw new IllegalStateException();
             };
             print(a, r);
@@ -140,6 +149,7 @@ public final class Cli {
         if (a.value("store-dir") != null) props.add("--dbmerge.store-dir=" + a.value("store-dir"));
         if (a.value("profile") != null) props.add("--spring.profiles.active=" + a.value("profile"));
         if (a.value("config") != null) props.add("--spring.config.additional-location=file:" + Path.of(a.value("config")).toAbsolutePath());
+        if (a.value("max-rows") != null) props.add("--dbmerge.max-rows-per-table=" + a.intOption("max-rows", 200_000, 0, Integer.MAX_VALUE));
         if (a.value("rules") != null) props.add("--dbmerge.rules-file=" + Path.of(a.value("rules")).toAbsolutePath());
         return app.run(props.toArray(String[]::new));
     }
@@ -234,7 +244,20 @@ public final class Cli {
 
     private Result ddl(CliArgs a, ConfigurableApplicationContext ctx, Path outDir) throws Exception {
         List<SchemaModel> models = extract(ctx, a.positional(), !a.has("no-ddl-text"));
-        ComparisonResult result = ctx.getBean(SchemaComparator.class).compare(models);
+        for (String snap : a.values("snapshot")) {
+            SchemaModel m;
+            try {
+                m = SchemaSnapshot.read(Path.of(snap), null);
+            } catch (java.io.IOException e) {
+                throw new UsageException(snap + ": " + e.getMessage());
+            }
+            if (models.stream().anyMatch(x -> x.nickname().equals(m.nickname()))) {
+                throw new UsageException("Snapshot " + snap + " is named '" + m.nickname()
+                        + "' after its file, like another database in this run: rename the file.");
+            }
+            models.add(m);
+        }
+        ComparisonResult result = ctx.getBean(SchemaComparator.class).compare(models, a.filter());
         Files.createDirectories(outDir);
         Path html = outDir.resolve("ddl-" + result.id() + ".html");
         Path xlsx = outDir.resolve("ddl-" + result.id() + ".xlsx");
@@ -248,9 +271,11 @@ public final class Cli {
         int code = ExitCodes.ddl(counts, threshold);
 
         List<String> lines = new ArrayList<>();
-        lines.add("DDL comparison " + result.id() + ": " + String.join(" vs ", a.positional()));
-        for (SchemaModel m : models) {
-            lines.add("  " + m.nickname() + " (" + m.owner() + "): " + m.tables().size() + " tables, " + m.sequences().size() + " sequences"
+        lines.add("DDL comparison " + result.id() + ": " + String.join(" vs ", result.databases()));
+        if (!result.filter().isEmpty()) lines.add("  filter: " + result.filter());
+        for (SchemaModel m : result.models()) {
+            lines.add("  " + m.nickname() + " (" + m.owner() + "): " + m.tables().size() + " tables, " + m.sequences().size() + " sequences, "
+                    + m.viewCount() + " views, " + m.plsqlCount() + " PL/SQL units"
                     + (m.warnings().isEmpty() ? "" : ", " + m.warnings().size() + " warning(s)"));
         }
         lines.add("  " + result.differences().size() + " difference(s): " + counts);
@@ -264,7 +289,7 @@ public final class Cli {
         Map<String, Object> json = new LinkedHashMap<>();
         json.put("command", "ddl");
         json.put("id", result.id());
-        json.put("databases", a.positional());
+        json.put("databases", result.databases());
         Map<String, Integer> sev = new LinkedHashMap<>();
         counts.forEach((k, v) -> sev.put(k.name(), v));
         json.put("severityCounts", sev);
@@ -287,7 +312,7 @@ public final class Cli {
 
     private Result data(CliArgs a, ConfigurableApplicationContext ctx, Path outDir) throws Exception {
         List<SchemaModel> models = extract(ctx, a.positional(), false);
-        ComparisonResult ddl = ctx.getBean(SchemaComparator.class).compare(models);
+        ComparisonResult ddl = ctx.getBean(SchemaComparator.class).compare(models, a.filter());
         DataReport report = ctx.getBean(DataCompareService.class).run(ddl.id(), ddl.models(), a.keys(), a.tables(),
                 ctx.getBean(DbMergeProperties.class).getSampleLimit());
         Files.createDirectories(outDir);
@@ -299,6 +324,7 @@ public final class Cli {
 
         List<String> lines = new ArrayList<>();
         lines.add("Data comparison " + report.id() + ": " + String.join(" vs ", a.positional()) + ", " + report.tables().size() + " table(s)");
+        if (!ddl.filter().isEmpty()) lines.add("  filter: " + ddl.filter());
         List<Map<String, Object>> tables = new ArrayList<>();
         int shown = 0;
         for (TableDataResult t : report.tables()) {
@@ -339,9 +365,32 @@ public final class Cli {
         return new Result(code, lines, json);
     }
 
+    private Result snapshot(CliArgs a, ConfigurableApplicationContext ctx, Path outDir) throws Exception {
+        String nick = a.positional().get(0);
+        CompareFilter filter = a.filter();
+        SchemaModel m = filter.apply(ctx.getBean(SchemaExtractor.class).extract(nick, false));
+        String stamp = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
+        Path file = a.value("file") != null ? Path.of(a.value("file")).toAbsolutePath()
+                : outDir.resolve("snapshot-" + nick + "-" + stamp + ".json");
+        SchemaSnapshot.write(m, filter.describe(), file);
+        List<String> lines = new ArrayList<>();
+        lines.add("Snapshot of " + nick + " (" + m.owner() + "): " + m.tables().size() + " tables, " + m.sequences().size()
+                + " sequences, " + m.viewCount() + " views, " + m.plsqlCount() + " PL/SQL units, " + m.synonyms().size()
+                + " synonyms, " + m.grants().size() + " grants");
+        if (!filter.isEmpty()) lines.add("  filter: " + filter.describe());
+        lines.add("  file: " + file);
+        Map<String, Object> json = new LinkedHashMap<>();
+        json.put("command", "snapshot");
+        json.put("connection", nick);
+        json.put("schema", m.owner());
+        json.put("tables", m.tables().size());
+        json.put("file", file.toString());
+        return new Result(ExitCodes.OK, lines, json);
+    }
+
     private Result refs(CliArgs a, ConfigurableApplicationContext ctx, Path outDir) throws Exception {
         String nick = a.positional().get(0);
-        ReferenceReport r = ctx.getBean(ReferenceService.class).run(nick, a.has("check-data"),
+        ReferenceReport r = ctx.getBean(ReferenceService.class).run(nick, a.filter(), a.has("check-data"),
                 a.intOption("timeout", 60, 1, 3_600), a.intOption("max-checks", 1_000, 1, 100_000));
         Files.createDirectories(outDir);
         Path html = outDir.resolve("refs-" + r.id() + ".html");
@@ -357,7 +406,7 @@ public final class Cli {
                 + r.declaredForeignKeys() + " declared foreign key(s)" + (r.dataChecked() ? ", data checked" : ""));
         lines.add("  " + r.candidates().size() + " candidate(s): " + counts);
         r.candidates().stream().limit(MAX_LINES).forEach(c ->
-                lines.add("    " + c.confidence() + "  " + c.qualifiedColumn() + " -> " + String.join(", ", c.parentTables())));
+                lines.add("    " + c.confidence() + "  " + c.qualifiedColumn() + "  " + target(c) + checkText(c)));
         if (r.candidates().size() > MAX_LINES) lines.add("    ... see the report for the rest");
         if (!r.warnings().isEmpty()) lines.add("  " + r.warnings().size() + " warning(s), see the report");
         lines.add("  fail-on " + threshold + " -> " + (code == ExitCodes.OK ? "pass" : "FAIL"));
@@ -380,6 +429,18 @@ public final class Cli {
             m.put("column", c.qualifiedColumn());
             m.put("parents", c.parentTables());
             m.put("rule", c.rule());
+            if (!c.dataChecks().isEmpty()) {
+                List<Map<String, Object>> checks = new ArrayList<>();
+                for (var d : c.dataChecks()) {
+                    Map<String, Object> dm = new LinkedHashMap<>();
+                    dm.put("parent", d.parentTable());
+                    dm.put("values", d.nonNullValues());
+                    dm.put("unresolved", d.unresolvedValues());
+                    if (d.error() != null) dm.put("error", d.error());
+                    checks.add(dm);
+                }
+                m.put("dataChecks", checks);
+            }
             list.add(m);
         }
         json.put("candidates", list);
@@ -396,7 +457,7 @@ public final class Cli {
         all.add(master);
         all.addAll(a.positional());
         List<SchemaModel> models = extract(ctx, all, true);
-        ComparisonResult ddl = ctx.getBean(SchemaComparator.class).compare(models);
+        ComparisonResult ddl = ctx.getBean(SchemaComparator.class).compare(models, a.filter());
         Options options = new Options(false, OrphanPolicy.valueOf(a.orphans()), a.sequences(), a.acknowledged());
         MergeService service = ctx.getBean(MergeService.class);
         MergePlan p = service.plan(ddl, master, a.positional(), a.keys(), options);
@@ -407,6 +468,7 @@ public final class Cli {
 
         List<String> lines = new ArrayList<>();
         lines.add("Merge dry run " + p.id() + ": " + String.join(", ", a.positional()) + " -> " + master + " (nothing was written)");
+        if (!ddl.filter().isEmpty()) lines.add("  filter: " + ddl.filter());
         List<Map<String, Object>> tables = new ArrayList<>();
         for (TableStep s : p.steps()) {
             Map<String, Long> counts = new LinkedHashMap<>();
@@ -473,5 +535,28 @@ public final class Cli {
             b.append(db).append('=').append(n == null || n.longValue() < 0 ? "missing" : n.toString());
         });
         return b.append('}').toString();
+    }
+
+    /** "-> BOOK", or what kind of finding it is when there is no single parent to name. */
+    static String target(com.dbmerge.refs.RefModel.Candidate c) {
+        return switch (c.kind()) {
+            case POLYMORPHIC -> "(type + ID pair: " + c.rule() + ")";
+            case UNRESOLVED_ID -> "(no matching table)";
+            default -> "-> " + String.join(", ", c.parentTables());
+        };
+    }
+
+    /** "  [100.0% of 3000000 resolve]" per parent, or empty when the data was not checked. */
+    static String checkText(com.dbmerge.refs.RefModel.Candidate c) {
+        if (c.dataChecks().isEmpty()) return "";
+        List<String> parts = new ArrayList<>();
+        for (var d : c.dataChecks()) {
+            String who = c.dataChecks().size() > 1 ? d.parentTable() + ": " : "";
+            if (d.error() != null) parts.add(who + "check failed");
+            else if (d.nonNullValues() == 0) parts.add(who + "no values");
+            else parts.add(who + String.format(java.util.Locale.ROOT, "%.1f%% of %d resolve",
+                    100.0 * (d.nonNullValues() - d.unresolvedValues()) / d.nonNullValues(), d.nonNullValues()));
+        }
+        return "  [" + String.join("; ", parts) + "]";
     }
 }

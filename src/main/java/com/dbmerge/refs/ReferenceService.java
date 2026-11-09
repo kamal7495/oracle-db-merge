@@ -28,7 +28,13 @@ public class ReferenceService {
     }
 
     public ReferenceReport run(String nickname, boolean checkData, int timeoutSeconds, int maxChecks) throws SQLException {
-        SchemaModel model = extractor.extract(nickname, false);
+        return run(nickname, com.dbmerge.ddl.compare.CompareFilter.NONE, checkData, timeoutSeconds, maxChecks);
+    }
+
+    /** As {@link #run(String, boolean, int, int)}, looking only at the objects the filter keeps. */
+    public ReferenceReport run(String nickname, com.dbmerge.ddl.compare.CompareFilter filter, boolean checkData,
+                               int timeoutSeconds, int maxChecks) throws SQLException {
+        SchemaModel model = filter.apply(extractor.extract(nickname, false));
         return analyse(nickname, model, checkData, timeoutSeconds, maxChecks);
     }
 

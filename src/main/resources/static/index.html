@@ -68,6 +68,14 @@
   <section>
     <h2>2. Phase 1 &mdash; compare DDL</h2>
     <p class="phases">Tick two or more connections. Every database is compared with every other; sources are opened read-only.</p>
+    <form id="filterForm" autocomplete="off" onsubmit="return false" style="margin:8px 0 12px">
+      <label>Leave out objects<input type="text" id="fltExclude" placeholder="BKP_*, TMP_*"></label>
+      <label>Only these objects (optional)<input type="text" id="fltInclude" placeholder="TRADE*, BOOK"></label>
+      <label class="span2">Compare with snapshot file(s) (optional)<input type="file" id="snapFiles" accept=".json,application/json" multiple></label>
+      <label class="span2">Ignore differences of kind<input type="text" id="fltIgnore" placeholder="CONSTRAINT_NAME_MISMATCH, INDEX_NAME_MISMATCH, GRANT"></label>
+      <div class="full phases">Wildcards: * or % for any characters, ? for one; _ is literal. Left-out tables are also left out of the
+        data comparison and the merge. Kinds may be categories: TABLE, COLUMN, CONSTRAINT, INDEX, SEQUENCE, TRIGGER, VIEW, MVIEW, PLSQL, CODE, SYNONYM, GRANT.</div>
+    </form>
     <button class="primary" id="runBtn" disabled>Extract &amp; compare</button>
     <span id="runMsg" class="msg"></span>
     <div id="result" style="margin-top:14px"></div>
@@ -142,7 +150,8 @@ async function api(path, opts) {
 function selected() {
   return [...document.querySelectorAll('#connTable input[type=checkbox]:checked')].map(c => c.value);
 }
-function updateRunBtn() { $('#runBtn').disabled = selected().length < 2; }
+function snapshotCount() { const f = $('#snapFiles'); return f && f.files ? f.files.length : 0; }
+function updateRunBtn() { $('#runBtn').disabled = selected().length + snapshotCount() < 2; }
 
 async function loadConnections() {
   const list = await api('/api/connections');
@@ -199,6 +208,8 @@ async function loadConnections() {
   if (list.some(c => c.nickname === prev)) sel.value = prev;
   $('#refsBtn').disabled = list.length === 0;
 }
+
+$('#snapFiles').addEventListener('change', updateRunBtn);
 
 $('#refsBtn').addEventListener('click', async () => {
   const btn = $('#refsBtn');
@@ -287,10 +298,17 @@ $('#runBtn').addEventListener('click', async () => {
   $('#runMsg').textContent = 'Extracting and comparing…';
   $('#result').replaceChildren();
   try {
+    const snapshots = await Promise.all([...$('#snapFiles').files].map(async f => ({ name: f.name, content: await f.text() })));
     const r = await api('/api/ddl/compare', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ nicknames: selected(), includeDdl: true }) });
+      body: JSON.stringify({ nicknames: selected(), includeDdl: true, snapshots,
+        exclude: [$('#fltExclude').value], include: [$('#fltInclude').value], ignore: [$('#fltIgnore').value] }) });
     $('#runMsg').textContent = '';
     renderResult(r);
+    if (r.snapshots.length) {
+      $('#result').append(el('p', { className: 'notice', textContent: 'Compared with snapshot(s) ' + r.snapshots.join(', ')
+        + '. The data comparison and the merge need live databases, so they are not offered for this run.' }));
+      return;
+    }
     await loadKeyPicker(r.id);
     showMerge(r.databases.map(d => d.nickname));
   } catch (e) {
@@ -310,6 +328,12 @@ function renderResult(r) {
       el('a', { href: r.htmlReport, target: '_blank', rel: 'noopener', textContent: 'Open HTML report' }), ' · ',
       el('a', { href: r.excelReport, textContent: 'Download Excel report' })),
     chips,
+    ...(r.filter ? [el('p', { className: 'notice', textContent: 'Filtered: ' + r.filter })] : []),
+    el('p', { className: 'phases' }, 'Save a snapshot to compare against later: ',
+      ...r.databases.filter(d => !r.snapshots.includes(d.nickname)).flatMap((d, i) => [i ? ' · ' : '',
+        el('a', { href: '/api/ddl/' + encodeURIComponent(r.id) + '/snapshot/' + encodeURIComponent(d.nickname), textContent: d.nickname })])),
+    ...r.databases.flatMap(d => d.warnings.filter(w => w.startsWith('Filter keeps'))
+      .map(w => el('p', { className: 'err', textContent: d.nickname + ': ' + w }))),
     el('p', { className: 'phases', textContent: r.databases.map(d => d.nickname + ': ' + d.tables + ' tables, '
       + d.views + ' views, ' + d.plsql + ' PL/SQL units, ' + d.synonyms + ' synonyms, ' + d.grants + ' grants').join(' · ') }));
   const warn = r.databases.flatMap(d => d.warnings.map(w => d.nickname + ': ' + w));

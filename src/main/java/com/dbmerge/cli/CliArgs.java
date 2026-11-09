@@ -19,7 +19,7 @@ import java.util.regex.Pattern;
  */
 public final class CliArgs {
 
-    public enum Command { CONNECTIONS, DDL, DATA, REFS, PLAN, HELP }
+    public enum Command { CONNECTIONS, DDL, DATA, REFS, PLAN, SNAPSHOT, HELP }
 
     /** Option definition: {@code valued} options take a value; {@code repeatable} ones may be given more than once. */
     record Opt(String name, boolean valued, boolean repeatable) { }
@@ -33,14 +33,25 @@ public final class CliArgs {
             new Opt("profile", true, false), new Opt("config", true, false), new Opt("password-env", true, true),
             new Opt("help", false, false));
 
+    /** --include / --exclude name patterns, and --ignore difference kinds where findings are compared. */
+    private static List<Opt> withFilter(boolean ignore, Opt... opts) {
+        List<Opt> out = new java.util.ArrayList<>(List.of(opts));
+        out.add(new Opt("include", true, true));
+        out.add(new Opt("exclude", true, true));
+        if (ignore) out.add(new Opt("ignore", true, true));
+        return List.copyOf(out);
+    }
+
     private static final Map<Command, List<Opt>> SPECIFIC = Map.of(
             Command.CONNECTIONS, List.of(new Opt("test", false, false)),
-            Command.DDL, List.of(new Opt("fail-on", true, false), new Opt("no-ddl-text", false, false)),
-            Command.DATA, List.of(new Opt("tables", true, true), new Opt("key", true, true),
-                    new Opt("allow-uncompared", false, false)),
-            Command.REFS, List.of(new Opt("check-data", false, false), new Opt("timeout", true, false),
+            Command.DDL, withFilter(true, new Opt("fail-on", true, false), new Opt("no-ddl-text", false, false),
+                    new Opt("snapshot", true, true)),
+            Command.SNAPSHOT, withFilter(false, new Opt("file", true, false)),
+            Command.DATA, withFilter(true, new Opt("tables", true, true), new Opt("key", true, true),
+                    new Opt("allow-uncompared", false, false), new Opt("max-rows", true, false)),
+            Command.REFS, withFilter(false, new Opt("check-data", false, false), new Opt("timeout", true, false),
                     new Opt("max-checks", true, false), new Opt("fail-on", true, false)),
-            Command.PLAN, List.of(new Opt("master", true, false), new Opt("key", true, true), new Opt("ack", true, true),
+            Command.PLAN, withFilter(true, new Opt("master", true, false), new Opt("key", true, true), new Opt("ack", true, true),
                     new Opt("orphans", true, false), new Opt("sequence", true, true), new Opt("rules", true, false),
                     new Opt("fail-on-warnings", false, false)),
             Command.HELP, List.of());
@@ -160,15 +171,25 @@ public final class CliArgs {
                 if (!positional.isEmpty()) throw new UsageException("'connections' takes no connection names.");
             }
             case DDL -> {
-                if (positional.size() < 2) throw new UsageException("'ddl' needs at least two connections.");
+                filter();
+                if (positional.size() + values("snapshot").size() < 2) {
+                    throw new UsageException("'ddl' needs at least two connections or snapshots (--snapshot FILE).");
+                }
                 ddlThreshold();
             }
+            case SNAPSHOT -> {
+                filter();
+                if (positional.size() != 1) throw new UsageException("'snapshot' needs exactly one connection.");
+            }
             case DATA -> {
+                filter();
                 if (positional.size() < 2) throw new UsageException("'data' needs at least two connections.");
                 tables();
                 keys();
+                intOption("max-rows", 200_000, 0, Integer.MAX_VALUE);
             }
             case REFS -> {
+                filter();
                 if (positional.size() != 1) throw new UsageException("'refs' needs exactly one connection.");
                 refsThreshold();
                 intOption("timeout", 60, 1, 3_600);
@@ -178,6 +199,7 @@ public final class CliArgs {
                 }
             }
             case PLAN -> {
+                filter();
                 String master = value("master");
                 if (master == null) throw new UsageException("'plan' needs --master NICKNAME.");
                 checkNickname(master);
@@ -285,6 +307,15 @@ public final class CliArgs {
             throw new UsageException("--fail-on must be one of " + String.join(", ", allowed.stream().sorted().toList()) + ".");
         }
         return ExitCodes.Threshold.valueOf(u);
+    }
+
+    /** The object filter from --include, --exclude and --ignore (empty when none given). */
+    public com.dbmerge.ddl.compare.CompareFilter filter() {
+        try {
+            return com.dbmerge.ddl.compare.CompareFilter.of(values("include"), values("exclude"), values("ignore"));
+        } catch (IllegalArgumentException e) {
+            throw new UsageException(e.getMessage());
+        }
     }
 
     public int intOption(String option, int dflt, int min, int max) {

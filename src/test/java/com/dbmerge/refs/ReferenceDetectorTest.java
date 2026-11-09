@@ -153,4 +153,15 @@ class ReferenceDetectorTest {
             assertTrue(all.get(i - 1).confidence().compareTo(all.get(i).confidence()) <= 0, "sorted by confidence");
         }
     }
+
+    @Test
+    void aUniqueNaturalKeyIsNotAnUnresolvedReference() {
+        var withUnique = table("DEAL").col(number("DEAL_ID", 1, 10, 0, false), varchar("EXTERNAL_REF", 2, 40, false),
+                        varchar("CPTY_REF", 3, 40, true))
+                .cons(pk("PK_DEAL", false, "DEAL_ID"), com.dbmerge.ddl.compare.Fixtures.unique("UQ_DEAL_EXT", false, "EXTERNAL_REF")).build();
+        Map<String, Candidate> f = new java.util.HashMap<>();
+        for (Candidate c : new ReferenceDetector().detect(model("M", withUnique))) f.put(c.qualifiedColumn(), c);
+        assertNull(f.get("DEAL.EXTERNAL_REF"), "unique on its own: a key of DEAL, not a reference");
+        assertEquals(Kind.UNRESOLVED_ID, f.get("DEAL.CPTY_REF").kind(), "a non-unique _REF column is still reported");
+    }
 }

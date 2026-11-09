@@ -1,0 +1,16 @@
+# Connections for the perf kit. Passwords come from the environment, never from this file.
+#   java -jar target/oracle-db-merge-0.1.0-SNAPSHOT.jar cli data PERF_A PERF_B --config perf/perf-config.yml
+dbmerge:
+  preload:
+    - nickname: PERF_A
+      host: localhost
+      port: 1521
+      service-name: FREEPDB1
+      username: PERF_A
+      password: ${DBMERGE_PERF_PASSWORD:}
+    - nickname: PERF_B
+      host: localhost
+      port: 1521
+      service-name: FREEPDB1
+      username: PERF_B
+      password: ${DBMERGE_PERF_PASSWORD:}

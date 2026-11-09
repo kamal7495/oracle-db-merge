@@ -83,7 +83,7 @@ public class DataController {
     @PostMapping("/data/compare")
     public Map<String, Object> compare(@RequestBody DataCompareRequest req) throws SQLException, IOException {
         if (req.ddlId() == null) throw new IllegalArgumentException("ddlId is required (run the DDL comparison first).");
-        ComparisonResult ddl = store.get(req.ddlId()).orElseThrow(() -> new IllegalArgumentException("Unknown DDL comparison: " + req.ddlId()));
+        ComparisonResult ddl = store.requireLive(req.ddlId());
         Set<String> only = req.tables() == null ? Set.of() : new LinkedHashSet<>(req.tables());
         DataReport report = service.run(ddl.id(), ddl.models(), req.keys(), only, props.getSampleLimit());
         store.put(report);

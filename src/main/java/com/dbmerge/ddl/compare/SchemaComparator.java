@@ -39,6 +39,18 @@ public class SchemaComparator {
     public static final String MISSING = "(missing)";
     public static final String NO_TABLE = "(table missing)";
 
+    /**
+     * Compares the models after removing what {@code filter} excludes, then drops the findings it ignores. The
+     * result holds the filtered models, so later phases built on it see the same objects.
+     */
+    public ComparisonResult compare(List<SchemaModel> models, CompareFilter filter) {
+        if (filter == null || filter.isEmpty()) return compare(models);
+        List<SchemaModel> kept = models == null ? null : models.stream().map(filter::apply).toList();
+        ComparisonResult r = compare(kept);
+        return new ComparisonResult(r.id(), r.generatedAt(), r.databases(), r.models(), filter.apply(r.differences()),
+                filter.describe());
+    }
+
     public ComparisonResult compare(List<SchemaModel> models) {
         if (models == null || models.size() < 2) {
             throw new IllegalArgumentException("At least two databases are needed to compare.");

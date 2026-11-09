@@ -52,6 +52,7 @@ public class ExcelReportWriter {
         int row = 0;
         put(s, row++, 0, "Oracle DDL comparison", st.bold);
         put(s, row++, 0, "Run " + r.id() + " at " + r.generatedAt(), st.plain);
+        if (!r.filter().isEmpty()) put(s, row++, 0, "Filtered: " + r.filter(), st.plain);
         row++;
         header(s, row++, st, "Database", "Schema", "Tables", "Columns", "Sequences", "Warnings",
                 "Views", "PL/SQL units", "Synonyms", "Grants");

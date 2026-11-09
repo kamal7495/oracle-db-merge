@@ -6,6 +6,8 @@ import com.dbmerge.conn.ConnectionRequest;
 import com.dbmerge.conn.ConnectionView;
 import com.dbmerge.conn.TestResult;
 import com.dbmerge.ddl.SchemaExtractor;
+import com.dbmerge.ddl.compare.CompareFilter;
+import com.dbmerge.ddl.model.SchemaSnapshot;
 import com.dbmerge.ddl.compare.ComparisonResult;
 import com.dbmerge.ddl.compare.Difference;
 import com.dbmerge.ddl.compare.SchemaComparator;
@@ -22,6 +24,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.Map;
 import java.util.regex.Pattern;
 import org.springframework.core.io.FileSystemResource;
@@ -95,19 +98,38 @@ public class ApiController {
 
     // ----------------------------------------------------------- phase 1: DDL
 
-    public record CompareRequest(List<String> nicknames, Boolean includeDdl) { }
+    /** {@code include}/{@code exclude}: name patterns; {@code ignore}: difference kinds or categories (see CompareFilter). */
+    public record CompareRequest(List<String> nicknames, Boolean includeDdl, List<String> include, List<String> exclude,
+                                 List<String> ignore, List<SnapshotUpload> snapshots) { }
+
+    /** A snapshot file uploaded from the browser: its file name (used as nickname) and JSON content. */
+    public record SnapshotUpload(String name, String content) { }
 
     @PostMapping("/ddl/compare")
     public Map<String, Object> compareDdl(@RequestBody CompareRequest req) throws SQLException, IOException {
         List<String> nicks = req.nicknames() == null ? List.of() : new ArrayList<>(new LinkedHashSet<>(req.nicknames()));
-        if (nicks.size() < 2) throw new IllegalArgumentException("Select at least two connections.");
+        List<SnapshotUpload> uploads = req.snapshots() == null ? List.of() : req.snapshots();
+        if (nicks.size() + uploads.size() < 2) throw new IllegalArgumentException("Select at least two connections, or a connection and a snapshot.");
         boolean ddl = req.includeDdl() == null || req.includeDdl();
 
-        List<SchemaModel> models = new ArrayList<>();
-        for (String n : nicks) models.add(extractor.extract(n, ddl));
+        CompareFilter filter = CompareFilter.of(req.include(), req.exclude(), req.ignore());
+        List<SchemaModel> extracted = new ArrayList<>();
+        for (String n : nicks) extracted.add(extractor.extract(n, ddl));
+        Set<String> snapshotNames = new LinkedHashSet<>();
+        for (SnapshotUpload u : uploads) {
+            if (u == null || u.content() == null) throw new IllegalArgumentException("Empty snapshot upload.");
+            String name = SchemaSnapshot.nicknameFor(u.name() == null ? "snapshot" : u.name());
+            SchemaModel m = SchemaSnapshot.fromJson(u.content(), name);
+            if (nicks.contains(name) || !snapshotNames.add(name)) {
+                throw new IllegalArgumentException("Snapshot '" + u.name() + "' would be named " + name
+                        + ", like another database in this comparison: rename the file.");
+            }
+            extracted.add(m);
+        }
 
-        ComparisonResult result = comparator.compare(models);
-        store.put(result);
+        ComparisonResult result = comparator.compare(extracted, filter);
+        List<SchemaModel> models = result.models();
+        store.put(result, snapshotNames);
 
         Files.createDirectories(reportsDir);
         String base = "ddl-" + result.id();
@@ -117,6 +139,8 @@ public class ApiController {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("id", result.id());
         body.put("generatedAt", result.generatedAt().toString());
+        body.put("filter", result.filter());
+        body.put("snapshots", List.copyOf(snapshotNames));
         List<Map<String, Object>> dbs = new ArrayList<>();
         for (SchemaModel m : models) {
             Map<String, Object> d = new LinkedHashMap<>();
@@ -154,6 +178,19 @@ public class ApiController {
         body.put("htmlReport", "/api/reports/" + base + ".html");
         body.put("excelReport", "/api/reports/" + base + ".xlsx");
         return body;
+    }
+
+    /** Downloads one database of a stored comparison as a snapshot file (filtered as that comparison was). */
+    @GetMapping("/ddl/{id}/snapshot/{nickname}")
+    public ResponseEntity<byte[]> snapshot(@PathVariable String id, @PathVariable String nickname) throws IOException {
+        ComparisonResult r = store.get(id).orElseThrow(() -> new IllegalArgumentException("Unknown DDL comparison: " + id));
+        SchemaModel m = r.models().stream().filter(x -> x.nickname().equals(nickname)).findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("No database '" + nickname + "' in comparison " + id + "."));
+        String stamp = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
+        return ResponseEntity.ok()
+                .header("Content-Disposition", "attachment; filename=\"snapshot-" + m.nickname() + "-" + stamp + ".json\"")
+                .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                .body(SchemaSnapshot.toJson(m, r.filter()).getBytes(StandardCharsets.UTF_8));
     }
 
     @GetMapping("/reports/{name}")

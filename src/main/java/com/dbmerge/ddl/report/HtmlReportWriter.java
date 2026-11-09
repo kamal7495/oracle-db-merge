@@ -30,6 +30,10 @@ public class HtmlReportWriter {
                 .append(esc(TS.format(r.generatedAt().atZone(ZoneId.systemDefault()))))
                 .append(" &middot; databases compared with each other: ").append(esc(String.join(", ", r.databases())))
                 .append("</p>");
+        if (!r.filter().isEmpty()) {
+            h.append("<p class=\"muted\"><strong>Filtered:</strong> ").append(esc(r.filter()))
+                    .append(". Objects and findings left out by the filter are not in this report.</p>");
+        }
 
         databases(h, r);
         summary(h, r);

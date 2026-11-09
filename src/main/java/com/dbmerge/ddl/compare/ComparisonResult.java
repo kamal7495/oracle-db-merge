@@ -12,7 +12,17 @@ public record ComparisonResult(
         Instant generatedAt,
         List<String> databases,
         List<SchemaModel> models,
-        List<Difference> differences) {
+        List<Difference> differences,
+        String filter) {             // CompareFilter#describe(), empty when nothing was filtered
+
+    public ComparisonResult {
+        filter = filter == null ? "" : filter;
+    }
+
+    public ComparisonResult(String id, Instant generatedAt, List<String> databases, List<SchemaModel> models,
+                            List<Difference> differences) {
+        this(id, generatedAt, databases, models, differences, "");
+    }
 
     public Map<Severity, Integer> countsBySeverity() {
         Map<Severity, Integer> m = new EnumMap<>(Severity.class);
