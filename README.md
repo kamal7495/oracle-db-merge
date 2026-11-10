@@ -340,8 +340,8 @@ merge again finds every row a duplicate: a repeated merge changes nothing.
 ## Tests
 
 ```bash
-mvn test      # unit tests (no database): comparator, registry, row matcher, FK graph, planner, script/alter generators, report writers, reference detector, REST API
-mvn verify    # also the Testcontainers integration tests (needs Docker): SchemaExtractorIT, MergeIT, LobMergeIT, ReferenceIT, DataHashCompareIT, LargeMergeIT, WebFlowIT
+mvn test      # unit tests (no database): comparator, registry, row matcher, FK graph, planner, script/alter generators, report writers, reference detector, REST API, read-only check rules
+mvn verify    # also the Testcontainers integration tests (needs Docker): SchemaExtractorIT, MergeIT, LobMergeIT, ReferenceIT, DataHashCompareIT, LargeMergeIT, BundleIT, WebFlowIT
 ```
 
 * `WebApiTest` (unit, no database) calls every REST endpoint as the UI does, with schema extraction replaced by fixed
@@ -364,6 +364,12 @@ export DOCKER_HOST=unix://$HOME/.colima/default/docker.sock
 export TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock
 mvn verify
 ```
+
+`BundleIT` creates two schema owners, a read-only user granted as `docs/readonly_user.sql` does, and one without
+`SELECT_CATALOG_ROLE`. It checks that `preflight` fails the owner, a user with a write grant, a user missing a table
+grant and a user who cannot see the whole schema; that the read-only user extracts exactly what the owner does;
+and that `bundle` stops before reading data when a login can write. Values planted in the source must reach
+`private/` and never `share/`.
 
 `LobMergeIT` builds its own `DOC`/`DOC_NOTE` tables (CLOB + BLOB) in code instead of using the sample scripts. `ReferenceIT` builds a small trading-style schema with **no** declared foreign keys and deliberately imperfect data (an orphan, a 1:1 product table, an ambiguous reference, a text column pointing at a number key), plus a second install whose re-keyed legal entity must make the merge refuse to run.
 
@@ -398,6 +404,7 @@ Results for 1 million trades (MacBook, Colima VM with 4 CPUs and 6 GB, Oracle Fr
 | `refs PERF_A --check-data` (filtered) | 3 s | 230 MB | 9 findings, all real: every planted reference, with 100 % resolution, and the ambiguous `TRADE.PRODUCT_ID` resolved by data (100 % to `PRODUCT_DESC`, 20 % to `PRODUCT_BOND`) |
 | `data PERF_A PERF_B` (all tables, hash) | 44 s | 800 MB | exact: `TRADE` 1 000 conflicts / 300 only in one, `TRADE_KEYWORD` 500 / 600, `BO_MESSAGE` 0 / 200. Memory is mostly `PRODUCT_DESC` (200 000 rows, compared in memory) |
 | `data --tables TRADE --max-rows 0` | 14 s | 350 MB | as above for `TRADE` |
+| `bundle --master` (read-only user) `PERF_A` (2 M trades) + `PERF_C` (1 M) | 3 min | 1.1 GB | every step: check 2 s, schemas 2 s, references 5 s, data 85 s, dry run 83 s; the estimates said 3 min each |
 | `snapshot` + `ddl PERF_B --snapshot` | 3 s each | 235 MB | a 42 KB snapshot; live `PERF_A` vs its snapshot shows 0 differences, `PERF_B` the 3 changes |
 
 Memory stays flat as tables grow: it follows the number of differing rows, not the table size. Time is the
@@ -419,12 +426,15 @@ sample rows by hashing the table again. Oracle's own statistics (`V$SQL`) showed
 ## Layout
 
 ```
-cli/     command-line mode (no web server): argument parsing, exit codes, ddl/data/refs/plan/snapshot/connections
+cli/     command-line mode (no web server): argument parsing, exit codes, ddl/data/refs/plan/snapshot/connections,
+         preflight, bundle
+check/   read-only check (Preflight), estimates, the shareable bundle summary (ShareSummary)
 conn/    connection registry, encrypted saved connections, read-only / master-only connections
-ddl/     extractor, model, comparator, filters, snapshots, HTML+Excel report
+ddl/     extractor (ALL_* or DBA_* views, see Dictionary), model, comparator, filters, snapshots, HTML+Excel report
 data/    row loader, matcher, compare service, HTML+Excel report
 merge/   planner, FK graph, ALTER generator, script renderer, executor, rules, service, report
 refs/    undeclared-reference detector, data check, HTML report
 web/     REST controllers; static/index.html is the UI
 perf/    (repo root) synthetic trading schema, data generator, drift script, timing runner
+docs/    (repo root) first-real-run.md (guide), readonly_user.sql (grants for a read-only user)
 ```
