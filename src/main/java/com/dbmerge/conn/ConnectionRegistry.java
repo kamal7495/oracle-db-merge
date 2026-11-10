@@ -253,7 +253,7 @@ public class ConnectionRegistry implements ConnectionSource {
         try (Connection c = openReadOnly(nickname);
              Statement s = c.createStatement();
              ResultSet rs = s.executeQuery(
-                     "SELECT sys_context('USERRENV','CURRENT_SCHEMA') FROM dual")) {
+                     "SELECT sys_context('USERENV','CURRENT_SCHEMA') FROM dual")) {
             String current = rs.next() ? rs.getString(1) : null;
             String version = c.getMetaData().getDatabaseProductVersion();
             String firstLine = version == null ? null : version.lines().findFirst().orElse(version);

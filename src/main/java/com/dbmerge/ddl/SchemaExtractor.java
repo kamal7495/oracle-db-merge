@@ -30,7 +30,7 @@ import java.util.regex.Pattern;
 
 /**
  * Reads tables, columns, PK/FK/unique/check constraints, indexes, sequences and triggers for one schema from the
- * ALL_* dictionary views, plus DBMS_METADATA DDL text for display. Also reads views, materialized views and
+ * ALL_* dictionary views (DBA_* when connected as another user who may read them, see {@link Dictionary}), plus DBMS_METADATA DDL text for display. Also reads views, materialized views and
  * stored PL/SQL (normalised source and VALID/INVALID status), private synonyms and object grants. Everything runs in a READ ONLY transaction.
  * Requires Oracle 12.2+ (ALL_CONSTRAINTS.SEARCH_CONDITION_VC).
  */
@@ -47,7 +47,10 @@ public class SchemaExtractor {
     public SchemaModel extract(String nickname, boolean includeDdl) throws SQLException {
         String owner = connections.schemaOf(nickname);
         List<String> warnings = new ArrayList<>();
-        try (Connection c = connections.openReadOnly(nickname)) {
+        try (Connection raw = connections.openReadOnly(nickname)) {
+            Dictionary dict = Dictionary.choose(raw, owner);
+            if (dict.warning() != null) warnings.add(dict.warning());
+            Connection c = dict.wrap(raw);
             List<String> tableNames = loadTableNames(c, owner);
             Map<String, Map<String, ColumnDef>> columns = loadColumns(c, owner);
             Map<String, List<ConstraintDef>> constraints = loadConstraints(c, owner);

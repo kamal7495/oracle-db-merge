@@ -111,7 +111,9 @@ public final class Cli {
             }
         }
         Path outDir = Path.of(a.value("out") == null ? "reports" : a.value("out")).toAbsolutePath().normalize();
-        try (ConfigurableApplicationContext ctx = startContext(a, outDir)) {
+        Path bundleRoot = a.command() == Command.BUNDLE ? Bundle.root(a) : null;
+        // a bundle's own reports (the dry run writes into the reports folder) all go to its private/ folder
+        try (ConfigurableApplicationContext ctx = startContext(a, bundleRoot != null ? Bundle.privateDir(bundleRoot) : outDir)) {
             ConnectionRegistry registry = ctx.getBean(ConnectionRegistry.class);
             applyPasswordEnv(a, registry, ctx.getBean(DbMergeProperties.class));
             requireUsable(a, registry);
@@ -122,6 +124,8 @@ public final class Cli {
                 case REFS -> refs(a, ctx, outDir);
                 case PLAN -> plan(a, ctx);
                 case SNAPSHOT -> snapshot(a, ctx, outDir);
+                case PREFLIGHT -> preflight(a, ctx, registry, outDir);
+                case BUNDLE -> new Bundle(a, ctx, registry, err, bundleRoot).run();
                 case HELP -> throw new IllegalStateException();
             };
             print(a, r);
@@ -448,6 +452,69 @@ public final class Cli {
         json.put("failOn", threshold.name());
         json.put("reports", List.of(html.toString()));
         return new Result(code, lines, json);
+    }
+
+    /** Read-only check of each connection; with --master, also the estimates for a bundle with the others as sources. */
+    private Result preflight(CliArgs a, ConfigurableApplicationContext ctx, ConnectionRegistry registry, Path outDir) {
+        List<String> all = new ArrayList<>();
+        if (a.value("master") != null) all.add(a.value("master"));
+        all.addAll(a.positional());
+        int maxRows = ctx.getBean(DbMergeProperties.class).getMaxRowsPerTable();
+        Map<String, String> targets = new LinkedHashMap<>();
+        for (ConnectionView v : registry.list()) targets.put(v.nickname(), v.host() + ":" + v.port() + "/" + v.serviceName());
+        com.dbmerge.check.Preflight pf = new com.dbmerge.check.Preflight(registry, maxRows);
+        List<com.dbmerge.check.Preflight.ConnectionReport> reports = new ArrayList<>();
+        for (String n : all) reports.add(pf.check(n, targets.get(n)));
+        com.dbmerge.check.Estimate est = a.value("master") != null && reports.size() > 1
+                ? com.dbmerge.check.Estimate.of(reports.get(0), reports.subList(1, reports.size()), maxRows, outDir) : null;
+
+        List<String> lines = new ArrayList<>();
+        boolean fail = false, unreachable = false;
+        for (var r : reports) {
+            lines.add(r.nickname() + ": " + r.status() + "  " + (r.target() == null ? "" : r.target()));
+            if (r.error() != null) {
+                lines.add("    " + r.error());
+                unreachable = true;
+                continue;
+            }
+            fail |= r.status() == com.dbmerge.check.Preflight.Status.FAIL;
+            lines.add("    database " + r.dbName() + " / " + r.container() + " (" + r.databaseRole() + "), " + r.version());
+            lines.add("    schema " + r.schema() + ", connected as " + r.sessionUser() + ", dictionary "
+                    + (r.owner() ? "owner" : r.dbaDictionary() ? "DBA_*" : "ALL_* (incomplete)"));
+            for (var c : r.checks()) lines.add(String.format("    %-4s  %s: %s", c.status(), c.name(), c.detail()));
+            lines.add(String.format(java.util.Locale.ROOT, "    %d tables, %d views, %d PL/SQL units, %d triggers; about %,d rows, %s by statistics",
+                    r.tables(), r.views(), r.plsqlUnits(), r.triggers(), r.totalRows(), com.dbmerge.check.Estimate.bytes(r.totalBytes())));
+            for (var t : r.largest().subList(0, Math.min(5, r.largest().size()))) {
+                lines.add(String.format(java.util.Locale.ROOT, "      %-30s %15s rows  %s", t.table(),
+                        t.rows() == null ? "?" : String.format(java.util.Locale.ROOT, "%,d", t.rows()), com.dbmerge.check.Estimate.bytes(t.bytes())));
+            }
+        }
+        if (est != null) {
+            lines.add("Estimates (perf-kit rates on a laptop; a real server may differ several times): data comparison "
+                    + com.dbmerge.check.Estimate.duration(est.dataSeconds()) + ", dry run " + com.dbmerge.check.Estimate.duration(est.planSeconds()));
+            for (var c : est.checks()) {
+                lines.add(String.format("    %-4s  %s: %s", c.status(), c.name(), c.detail()));
+                fail |= c.status() == com.dbmerge.check.Preflight.Status.FAIL;
+            }
+        }
+        lines.add(unreachable ? "FAIL (a connection could not be opened)" : fail ? "FAIL: fix the FAIL lines before running 'cli bundle'" : "pass");
+        Map<String, Object> json = new LinkedHashMap<>();
+        json.put("command", "preflight");
+        json.put("connections", reports.stream().map(r -> {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("nickname", r.nickname());
+            m.put("status", r.status().name());
+            m.put("schema", r.schema());
+            m.put("connectedAs", r.sessionUser());
+            m.put("database", r.dbName());
+            m.put("error", r.error());
+            m.put("checks", r.checks());
+            m.put("tables", r.tables());
+            m.put("rows", r.totalRows());
+            return m;
+        }).toList());
+        if (est != null) json.put("estimate", est);
+        return new Result(unreachable ? ExitCodes.RUNTIME : fail ? ExitCodes.FINDINGS : ExitCodes.OK, lines, json);
     }
 
     /** Dry run only. Nothing is written to any database; there is no execute command. */

@@ -42,6 +42,8 @@ final class CliHelp {
                       refs A                      undeclared-reference report; fails on HIGH-confidence findings
                       plan --master M S [S...]    merge dry run (never writes); fails on blockers
                       snapshot A [--file F]       save A's structure to a JSON file, to compare against later
+                      preflight A [B...]          read-only check: right database, no write rights, everything visible, sizes
+                      bundle --master M S [S...]  read-only check, then every report into one folder, with a summary to share
 
                     Run 'cli <command> --help' for the options of a command. There is no command that executes a merge:
                     review the dry run and execute it from the web UI.
@@ -87,6 +89,40 @@ final class CliHelp {
                       --timeout S          per-query timeout in seconds (default 60)
                       --max-checks N       cap on data-check queries (default 1000)
                       --fail-on LEVEL      HIGH (default), MEDIUM, LOW or NEVER
+                    """ + COMMON;
+            case PREFLIGHT -> """
+                    Usage: cli preflight [--master M] A [B...] [--max-rows N] [common options]
+
+                    Checks each connection before a first run against a real database, reading only dictionary and
+                    session views (no table is scanned):
+                      * which database, container and schema it reached, and as which user
+                      * whether the login could change the schema: owner, write privileges, write grants (FAIL)
+                      * whether the whole schema is visible (DBA_* views or owner) and every table readable (FAIL)
+                      * Oracle version, hashing functions, DDL text, statistics, tables without a key
+                      * table count and sizes from optimizer statistics, the largest tables
+                    With --master, also estimates the bundle's time and plan-file disk space against the free space.
+                    Exit 0 when nothing FAILs, 1 when something does, 3 when a connection cannot be opened.
+                      --master M     the master of a later bundle (the others are its sources)
+                      --max-rows N   streaming threshold used for the estimates (default 200000)
+                    """ + COMMON;
+            case BUNDLE -> """
+                    Usage: cli bundle --master M S [S...] [plan options] [bundle options] [common options]
+
+                    Runs the read-only check and stops if anything FAILs. Otherwise reads each schema once and writes,
+                    into <out>/bundle-<timestamp>/:
+                      share/summary.md, summary.json   counts, checks, schema names and differences; no row values
+                      private/                         the full reports (ddl, refs, data, merge dry run), snapshots, run.log
+                    Nothing is written to any database. A failed step is recorded and the others still run.
+                    Bundle options:
+                      --tables T1,T2           data comparison only for these tables (repeatable)
+                      --max-rows N             tables above N rows are hashed / streamed (default 200000)
+                      --no-check-data          don't count unresolved values for undeclared references
+                      --skip-data              no data comparison
+                      --skip-plan              no merge dry run (it needs disk space for large tables)
+                      --allow-write-access     go on although a login could change its schema (the tool still only reads)
+                      --allow-incomplete       go on although part of a schema is invisible or unreadable
+                    Plan options as for 'cli plan': --key, --ack, --sequence, --orphans, --rules.
+                    Exit 0 when every step ran, 1 when the read-only check stopped the bundle, 3 when a step failed.
                     """ + COMMON;
             case PLAN -> """
                     Usage: cli plan --master M S [S...] [options] [common options]

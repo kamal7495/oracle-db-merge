@@ -84,6 +84,12 @@ public class MergeService {
         return result;
     }
 
+    /** Forgets a plan and deletes its files, e.g. after a dry run whose reports are all that is wanted. */
+    public synchronized void forget(String planId) {
+        MergePlan p = plans.remove(planId);
+        if (p != null) discard(p);
+    }
+
     /** Deletes a plan's files (large tables); the plan cannot be read or run afterwards. */
     private static void discard(MergePlan plan) {
         for (var s : plan.steps()) if (s.rows() instanceof PlanRows planned) planned.delete();

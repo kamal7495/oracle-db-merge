@@ -8,16 +8,17 @@ Compare and merge **N Oracle databases into one master**. Java 17, Maven, `ojdbc
 * **Undeclared references** – for one schema, list the columns that act like foreign keys but have no FOREIGN KEY constraint, optionally checked against the data. Run this before merging a schema whose integrity lives in the application (typical of vendor packages such as trading systems).
 
 > **Status of this build – read this first.**
-> `mvn verify` passes: the unit tests plus the Testcontainers integration tests against Oracle Free 23 (`SchemaExtractorIT`, `MergeIT`, `LobMergeIT`, `ReferenceIT`, `DataHashCompareIT`, `LargeMergeIT`, `WebFlowIT`). These cover extraction, the Phase 2 comparison (in memory and by server-side hash), planning, executing, rolling back and validating merges (including BLOB/CLOB columns), the undeclared-reference detection with its data check, every REST endpoint (`WebApiTest`, no database), and the UI itself: `WebFlowIT` drives a complete merge through the page in headless Chromium.
+> `mvn verify` passes: the unit tests plus the Testcontainers integration tests against Oracle Free 23 (`SchemaExtractorIT`, `MergeIT`, `LobMergeIT`, `ReferenceIT`, `DataHashCompareIT`, `LargeMergeIT`, `BundleIT`, `WebFlowIT`). These cover extraction (also through a read-only user), the Phase 2 comparison (in memory and by server-side hash), planning, executing, rolling back and validating merges (including BLOB/CLOB columns), the undeclared-reference detection with its data check, every REST endpoint (`WebApiTest`, no database), the read-only check and the report bundle (`BundleIT` plants values in a source and checks they never reach `share/`), and the UI itself: `WebFlowIT` drives a complete merge through the page in headless Chromium.
 > **Lightly covered:** the content of the Phase 2 Excel report and the merge reports (generated and downloaded in tests, not checked cell by cell).
 > **Do not point the executor at a real master before a dry run on a copy and a Data Pump backup.**
+> **First time on a real database?** Follow [docs/first-real-run.md](docs/first-real-run.md): a read-only user, `cli preflight`, then `cli bundle`.
 
 ## Requirements
 
 * JDK 17+, Maven 3.9+
 * Network access to your Oracle databases. Oracle 12.2+ (the extractor reads `SEARCH_CONDITION_VC`); tested design target is Oracle 19c/23ai.
 * Docker, only for the integration tests (`gvenzl/oracle-free:23-slim-faststart`)
-* The account used per database needs `SELECT` on the `ALL_*` dictionary views (granted by default) and, for DDL text, `EXECUTE` on `DBMS_METADATA` (granted to `PUBLIC` by default). For the **master** account also `CREATE TABLE`/`ALTER` privileges in its own schema if you approve schema changes, plus `ALTER TRIGGER` if you use "disable triggers".
+* The account used per database needs `SELECT` on the `ALL_*` dictionary views (granted by default) and, for DDL text, `EXECUTE` on `DBMS_METADATA` (granted to `PUBLIC` by default). To compare through a **read-only user** instead of the schema owner (recommended for anything real), set the connection's schema and grant what [docs/readonly_user.sql](docs/readonly_user.sql) grants: `READ` on the tables plus `SELECT_CATALOG_ROLE`. With that role the extractor reads the `DBA_*` views, so the read-only user sees exactly what the owner sees. Without it Oracle hides the schema's PL/SQL, triggers and grants from another user; the extractor then warns that differences in them can be hidden. For the **master** account also `CREATE TABLE`/`ALTER` privileges in its own schema if you approve schema changes, plus `ALTER TRIGGER` if you use "disable triggers".
 
 ## Run
 
@@ -61,13 +62,15 @@ java -jar target/oracle-db-merge-*.jar cli help            # or: cli <command> -
 | `data A B [C...]` | Phase 2 comparison, writes `data-<id>.html` and `.xlsx`. `--tables T1,T2`, `--key TABLE=COL1,COL2`, `--max-rows N` (above N rows, compare by hash; `0` hashes every table) | any difference: rows only in some databases, conflicts, key collisions, different row counts, a table in only one database. Tables that could not be compared (no key, error) also fail unless `--allow-uncompared` |
 | `refs A` | undeclared-reference report, writes `refs-<id>.html`. `--check-data [--timeout S] [--max-checks N]` | a candidate at or above `--fail-on` confidence (`HIGH` default, `MEDIUM`, `LOW`, `NEVER`) |
 | `snapshot A [--file F]` | saves A's structure to a JSON file (default `snapshot-A-<time>.json`), see [Snapshots](#snapshots) | never (exit 0) |
+| `preflight [--master M] A [B...]` | read-only check, from the dictionary only (no table scanned): which database, schema and user it reached; whether the login could change the schema (owner, write privileges, write grants); whether the whole schema is visible and every table readable; Oracle version, hashing, DDL text, statistics; sizes and the largest tables. With `--master`, estimated bundle time and plan-file disk space against free space | anything FAILs (exit 3 if a connection cannot be opened) |
+| `bundle --master M S [S...]` | `preflight`, then (only if nothing FAILs) every report a first look needs, into `bundle-<time>/`: `share/summary.md` and `summary.json` with counts, checks and schema names but **no row values**, and `private/` with the full reports, snapshots and `run.log`. Each schema is read once. Options as for `plan`, plus `--tables`, `--max-rows`, `--skip-data`, `--skip-plan`, `--no-check-data`, and the overrides `--allow-write-access`, `--allow-incomplete` | the read-only check stopped it (exit 3 if a step failed; the others still run) |
 | `plan --master M S [S...]` | merge **dry run**, writes `merge-<id>.html` and the review `.sql`. `--key`, `--ack TABLE.COLUMN`, `--sequence TABLE=SEQ`, `--orphans fail\|skip`, `--rules FILE` | any blocker (including unresolved conflicts and undeclared references that would break); also warnings with `--fail-on-warnings` |
 
 There is **no command that executes a merge**: review the dry run and execute it from the web UI.
 
 Common options: `--out DIR` (reports, default `reports`), `--json` (JSON summary on stdout), `--store-dir DIR`, `--profile NAME`, `--config FILE`, `--password-env NICK=VAR`.
 
-Filters, for `ddl`, `data`, `refs`, `plan` and `snapshot`: `--exclude 'BKP_*,TMP_*'`, `--include 'TRADE*'` and, except for `refs` and `snapshot`, `--ignore CONSTRAINT_NAME_MISMATCH,GRANT`. See [Filters](#filters-and-ignored-differences).
+Filters, for `ddl`, `data`, `refs`, `plan`, `bundle` and `snapshot`: `--exclude 'BKP_*,TMP_*'`, `--include 'TRADE*'` and, except for `refs` and `snapshot`, `--ignore CONSTRAINT_NAME_MISMATCH,GRANT`. See [Filters](#filters-and-ignored-differences).
 
 **Exit codes:** `0` pass · `1` findings at or above the threshold · `2` usage error (bad arguments, unknown or locked connection, missing environment variable) · `3` connection or runtime error.
 

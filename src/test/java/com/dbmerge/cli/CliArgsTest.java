@@ -142,4 +142,23 @@ class CliArgsTest {
         assertTrue(usage("ddl", "DB_A").contains("--snapshot"), "one live database alone is not enough");
         assertTrue(usage("data", "DB_A", "--snapshot", "x.json").contains("snapshot"), "data needs live rows");
     }
+
+    @Test
+    void preflightAndBundleCommands() {
+        assertEquals(CliArgs.Command.PREFLIGHT, parse("preflight", "A").command());
+        assertEquals("M", parse("preflight", "--master", "M", "A").value("master"));
+        assertTrue(usage("preflight").contains("at least one connection"));
+        assertTrue(usage("preflight", "--master", "A", "A").contains("listed twice"));
+
+        CliArgs b = parse("bundle", "--master", "M", "S1", "S2", "--key", "TRADE=EXTERNAL_REF", "--skip-plan", "--allow-write-access");
+        assertEquals(CliArgs.Command.BUNDLE, b.command());
+        assertEquals(List.of("S1", "S2"), b.positional());
+        assertTrue(b.has("skip-plan") && b.has("allow-write-access") && !b.has("allow-incomplete"));
+        assertTrue(usage("bundle", "S1").contains("needs --master"));
+        assertTrue(usage("bundle", "--master", "M").contains("at least one source"));
+        assertTrue(usage("bundle", "--master", "M", "M").contains("cannot also be a source"));
+        assertTrue(usage("bundle", "--master", "M", "S", "--skip-data", "--tables", "T").contains("--skip-data"));
+        assertTrue(usage("bundle", "--master", "M", "S", "--fail-on", "HIGH").contains("Unknown option --fail-on"));
+        assertTrue(usage("bundle", "--master", "M", "S", "--password", "x").contains("not accepted on the command line"));
+    }
 }

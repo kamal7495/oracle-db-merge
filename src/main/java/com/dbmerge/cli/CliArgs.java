@@ -19,7 +19,7 @@ import java.util.regex.Pattern;
  */
 public final class CliArgs {
 
-    public enum Command { CONNECTIONS, DDL, DATA, REFS, PLAN, SNAPSHOT, HELP }
+    public enum Command { CONNECTIONS, DDL, DATA, REFS, PLAN, SNAPSHOT, PREFLIGHT, BUNDLE, HELP }
 
     /** Option definition: {@code valued} options take a value; {@code repeatable} ones may be given more than once. */
     record Opt(String name, boolean valued, boolean repeatable) { }
@@ -42,19 +42,25 @@ public final class CliArgs {
         return List.copyOf(out);
     }
 
-    private static final Map<Command, List<Opt>> SPECIFIC = Map.of(
-            Command.CONNECTIONS, List.of(new Opt("test", false, false)),
-            Command.DDL, withFilter(true, new Opt("fail-on", true, false), new Opt("no-ddl-text", false, false),
-                    new Opt("snapshot", true, true)),
-            Command.SNAPSHOT, withFilter(false, new Opt("file", true, false)),
-            Command.DATA, withFilter(true, new Opt("tables", true, true), new Opt("key", true, true),
-                    new Opt("allow-uncompared", false, false), new Opt("max-rows", true, false)),
-            Command.REFS, withFilter(false, new Opt("check-data", false, false), new Opt("timeout", true, false),
-                    new Opt("max-checks", true, false), new Opt("fail-on", true, false)),
-            Command.PLAN, withFilter(true, new Opt("master", true, false), new Opt("key", true, true), new Opt("ack", true, true),
+    private static final Map<Command, List<Opt>> SPECIFIC = Map.ofEntries(
+            Map.entry(Command.CONNECTIONS, List.of(new Opt("test", false, false))),
+            Map.entry(Command.DDL, withFilter(true, new Opt("fail-on", true, false), new Opt("no-ddl-text", false, false),
+                    new Opt("snapshot", true, true))),
+            Map.entry(Command.SNAPSHOT, withFilter(false, new Opt("file", true, false))),
+            Map.entry(Command.DATA, withFilter(true, new Opt("tables", true, true), new Opt("key", true, true),
+                    new Opt("allow-uncompared", false, false), new Opt("max-rows", true, false))),
+            Map.entry(Command.REFS, withFilter(false, new Opt("check-data", false, false), new Opt("timeout", true, false),
+                    new Opt("max-checks", true, false), new Opt("fail-on", true, false))),
+            Map.entry(Command.PLAN, withFilter(true, new Opt("master", true, false), new Opt("key", true, true), new Opt("ack", true, true),
                     new Opt("orphans", true, false), new Opt("sequence", true, true), new Opt("rules", true, false),
-                    new Opt("fail-on-warnings", false, false)),
-            Command.HELP, List.of());
+                    new Opt("fail-on-warnings", false, false))),
+            Map.entry(Command.PREFLIGHT, List.of(new Opt("master", true, false), new Opt("max-rows", true, false))),
+            Map.entry(Command.BUNDLE, withFilter(true, new Opt("master", true, false), new Opt("key", true, true), new Opt("ack", true, true),
+                    new Opt("orphans", true, false), new Opt("sequence", true, true), new Opt("rules", true, false),
+                    new Opt("tables", true, true), new Opt("max-rows", true, false), new Opt("no-check-data", false, false),
+                    new Opt("skip-data", false, false), new Opt("skip-plan", false, false),
+                    new Opt("allow-write-access", false, false), new Opt("allow-incomplete", false, false))),
+            Map.entry(Command.HELP, List.of()));
 
     private final Command command;
     private final Map<String, List<String>> options;
@@ -137,7 +143,7 @@ public final class CliArgs {
         try {
             return Command.valueOf(s.toUpperCase(Locale.ROOT));
         } catch (IllegalArgumentException e) {
-            throw new UsageException("Unknown command '" + s + "'. Commands: connections, ddl, data, refs, plan, help.");
+            throw new UsageException("Unknown command '" + s + "'. Commands: connections, ddl, data, refs, plan, snapshot, preflight, bundle, help.");
         }
     }
 
@@ -209,6 +215,29 @@ public final class CliArgs {
                 acknowledged();
                 sequences();
                 orphans();
+            }
+            case PREFLIGHT -> {
+                if (positional.isEmpty() && value("master") == null) throw new UsageException("'preflight' needs at least one connection.");
+                if (value("master") != null) {
+                    checkNickname(value("master"));
+                    if (positional.contains(value("master"))) throw new UsageException("The master is listed twice.");
+                }
+                intOption("max-rows", 200_000, 0, Integer.MAX_VALUE);
+            }
+            case BUNDLE -> {
+                filter();
+                String master = value("master");
+                if (master == null) throw new UsageException("'bundle' needs --master NICKNAME.");
+                checkNickname(master);
+                if (positional.isEmpty()) throw new UsageException("'bundle' needs at least one source connection.");
+                if (positional.contains(master)) throw new UsageException("The master cannot also be a source.");
+                keys();
+                tables();
+                acknowledged();
+                sequences();
+                orphans();
+                intOption("max-rows", 200_000, 0, Integer.MAX_VALUE);
+                if (has("skip-data") && has("tables")) throw new UsageException("--tables only applies to the data comparison, which --skip-data turns off.");
             }
             case HELP -> { }
         }
